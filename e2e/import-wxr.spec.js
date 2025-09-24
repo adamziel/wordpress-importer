@@ -126,6 +126,43 @@ https://playground.internal/path-not-taken was the second best choice.
 					// Verify frontend rendering
 					await goToPostFrontend(page, post);
 					await expect(page.getByText('URLs to rewrite')).toBeVisible();
+			},
+			{ parser }
+		);
+		});
+
+		test(`imports a media attachment with flat uploads using ${parser} parser`, async ({
+			page,
+			request,
+		}) => {
+			await withPlaygroundServer(
+				async () => {
+					await ensureFlatUploadsStructure(page);
+
+					await runWxrImport(page, 'wxr-flat-attachment.xml', {
+						fetchAttachments: true,
+					});
+
+					const mediaRes = await request.get(
+						abs('/wp-json/wp/v2/media?search=canola2&per_page=5')
+					);
+					expect(mediaRes.ok()).toBeTruthy();
+					const mediaItems = await mediaRes.json();
+					expect(Array.isArray(mediaItems) && mediaItems.length > 0).toBeTruthy();
+					const attachment =
+						mediaItems.find((item) => item.slug === 'canola2') || mediaItems[0];
+
+					expect(attachment).toMatchObject({
+						title: expect.objectContaining({ rendered: expect.stringContaining('canola2') }),
+						source_url: `${PLAYGROUND_URL}/wp-content/uploads/canola2.jpg`,
+					});
+					expect(attachment?.guid?.rendered || '').toContain(PLAYGROUND_URL);
+					expect(attachment?.media_details?.file || '').toBe('canola2.jpg');
+
+					const response = await page.goto(
+						`${PLAYGROUND_URL}/wp-content/uploads/canola2.jpg`
+					);
+					expect(response?.status()).toBe(200);
 				},
 				{ parser }
 			);
@@ -341,7 +378,7 @@ function abs(u) {
 }
 
 // Helper: Run WXR import process
-async function runWxrImport(page, filename, { rewriteUrls = true } = {}) {
+async function runWxrImport(page, filename, { rewriteUrls = true, fetchAttachments = false } = {}) {
 	// Extra time for CI/Playground
 	test.setTimeout(240000);
 
@@ -370,6 +407,13 @@ async function runWxrImport(page, filename, { rewriteUrls = true } = {}) {
 		await page.check('#rewrite-urls');
 	} else {
 		await page.uncheck('#rewrite-urls');
+	}
+
+	if (fetchAttachments) {
+		const attachmentsCheckbox = page.locator('#import-attachments');
+		if (await attachmentsCheckbox.count()) {
+			await attachmentsCheckbox.check();
+		}
 	}
 
 	// Proceed to step=2 (author mapping defaults to current user)
@@ -506,6 +550,38 @@ async function goToImporter(page) {
 	await loginIfNeeded(page);
 	await page.goto(abs('/wp-admin/admin.php?import=wordpress'));
 	await loginIfNeeded(page);
+}
+
+async function ensureFlatUploadsStructure(page) {
+	await page.goto(abs('/wp-admin/options-media.php'));
+	await loginIfNeeded(page);
+
+	const checkbox = page.locator('#uploads_use_yearmonth_folders');
+	if (!(await checkbox.count())) {
+		return;
+	}
+
+	if (await checkbox.isChecked()) {
+		await checkbox.uncheck();
+	}
+
+	const saveButton = page.getByRole('button', { name: /Save Changes/i });
+	if (await saveButton.count()) {
+		await Promise.all([
+			page.waitForNavigation({ waitUntil: 'domcontentloaded' }),
+			saveButton.click(),
+		]);
+	} else {
+		const submit = page.locator('form[action$="options.php"] input[type="submit"]');
+		if (await submit.count()) {
+			await Promise.all([
+				page.waitForNavigation({ waitUntil: 'domcontentloaded' }),
+				submit.first().click(),
+			]);
+		}
+	}
+
+	await expect(checkbox).not.toBeChecked();
 }
 
 async function performImport(page, { mapAuthorsToAdmin = false } = {}) {
