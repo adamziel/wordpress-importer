@@ -6,7 +6,7 @@
  * @subpackage Importer
  */
 
-use WordPress\ByteStream\ReadStream\FileReadStream;
+use WordPress\DataLiberation\EntityReader\WXREntityReader;
 
 /**
  * WXR Parser that uses the XMLProcessor component.
@@ -43,7 +43,7 @@ class WXR_Parser_XML_Processor {
 		$wxr_version         = '';
 
 		try {
-			$reader = $this->create_wxr_entity_reader( $file );
+			$reader = WXREntityReader::create_for_wordpress_importer( $file );
 			// Parse the XML document
 			$last_term = null;
 			while ( $reader->next_entity() ) {
@@ -202,167 +202,4 @@ class WXR_Parser_XML_Processor {
 		);
 	}
 
-	private function create_wxr_entity_reader( $file ) {
-		// Every XML element is a combination of a long-form namespace and a
-		// local element name, e.g. a syntax <wp:post_id> could actually refer
-		// to a (https://wordpress.org/export/1.0/, post_id) element.
-		//
-		// Namespaces are paramount for parsing XML and cannot be ignored. Elements
-		// element must be matched based on both their namespace and local name.
-		//
-		// Unfortunately, different WXR files defined the `wp` namespace in a different way.
-		// Folks use a mixture of HTTP vs HTTPS protocols and version numbers. We must
-		// account for all possible options to parse these documents correctly.
-		$wxr_namespaces = array(
-			'http://wordpress.org/export/1.0/',
-			'https://wordpress.org/export/1.0/',
-			'http://wordpress.org/export/1.1/',
-			'https://wordpress.org/export/1.1/',
-			'http://wordpress.org/export/1.2/',
-			'https://wordpress.org/export/1.2/',
-		);
-		$known_entities = array(
-			'item' => array(
-				'type'   => 'post',
-				'fields' => array(
-					'title'       => 'post_title',
-					'guid'        => 'guid',
-					'description' => 'post_excerpt',
-					'{http://purl.org/dc/elements/1.1/}creator' => 'post_author',
-					'{http://purl.org/rss/1.0/modules/content/}encoded' => 'post_content',
-					'{http://wordpress.org/export/1.0/excerpt/}encoded' => 'post_excerpt',
-					'{http://wordpress.org/export/1.1/excerpt/}encoded' => 'post_excerpt',
-					'{http://wordpress.org/export/1.2/excerpt/}encoded' => 'post_excerpt',
-				),
-			),
-		);
-
-		$known_site_options = array();
-
-		foreach ( $wxr_namespaces as $wxr_namespace ) {
-			$known_site_options               = array_merge(
-				$known_site_options,
-				array(
-					'{' . $wxr_namespace . '}base_blog_url' => 'home',
-					'{' . $wxr_namespace . '}base_site_url' => 'siteurl',
-					'{' . $wxr_namespace . '}wxr_version' => 'wxr_version',
-					'title'                               => 'blogname',
-				)
-			);
-			$known_entities['item']['fields'] = array_merge(
-				$known_entities['item']['fields'],
-				array(
-					'{' . $wxr_namespace . '}post_id'     => 'post_id',
-					'{' . $wxr_namespace . '}status'      => 'status',
-					'{' . $wxr_namespace . '}post_date'   => 'post_date',
-					'{' . $wxr_namespace . '}post_date_gmt' => 'post_date_gmt',
-					'{' . $wxr_namespace . '}post_modified' => 'post_modified',
-					'{' . $wxr_namespace . '}post_modified_gmt' => 'post_modified_gmt',
-					'{' . $wxr_namespace . '}comment_status' => 'comment_status',
-					'{' . $wxr_namespace . '}ping_status' => 'ping_status',
-					'{' . $wxr_namespace . '}post_name'   => 'post_name',
-					'{' . $wxr_namespace . '}post_parent' => 'post_parent',
-					'{' . $wxr_namespace . '}menu_order'  => 'menu_order',
-					'{' . $wxr_namespace . '}post_type'   => 'post_type',
-					'{' . $wxr_namespace . '}post_password' => 'post_password',
-					'{' . $wxr_namespace . '}is_sticky'   => 'is_sticky',
-					'{' . $wxr_namespace . '}attachment_url' => 'attachment_url',
-				)
-			);
-			$known_entities                   = array_merge(
-				$known_entities,
-				array(
-					'{' . $wxr_namespace . '}comment'     => array(
-						'type'   => 'comment',
-						'fields' => array(
-							'{' . $wxr_namespace . '}comment_id'   => 'comment_id',
-							'{' . $wxr_namespace . '}comment_author' => 'comment_author',
-							'{' . $wxr_namespace . '}comment_author_email' => 'comment_author_email',
-							'{' . $wxr_namespace . '}comment_author_url' => 'comment_author_url',
-							'{' . $wxr_namespace . '}comment_author_IP' => 'comment_author_IP',
-							'{' . $wxr_namespace . '}comment_date' => 'comment_date',
-							'{' . $wxr_namespace . '}comment_date_gmt' => 'comment_date_gmt',
-							'{' . $wxr_namespace . '}comment_content' => 'comment_content',
-							'{' . $wxr_namespace . '}comment_approved' => 'comment_approved',
-							'{' . $wxr_namespace . '}comment_type' => 'comment_type',
-							'{' . $wxr_namespace . '}comment_parent' => 'comment_parent',
-							'{' . $wxr_namespace . '}comment_user_id' => 'comment_user_id',
-						),
-					),
-					'{' . $wxr_namespace . '}commentmeta' => array(
-						'type'   => 'comment_meta',
-						'fields' => array(
-							'{' . $wxr_namespace . '}meta_key' => 'key',
-							'{' . $wxr_namespace . '}meta_value' => 'value',
-						),
-					),
-					'{' . $wxr_namespace . '}author'      => array(
-						'type'   => 'user',
-						'fields' => array(
-							'{' . $wxr_namespace . '}author_id'    => 'author_id',
-							'{' . $wxr_namespace . '}author_login' => 'author_login',
-							'{' . $wxr_namespace . '}author_email' => 'author_email',
-							'{' . $wxr_namespace . '}author_display_name' => 'author_display_name',
-							'{' . $wxr_namespace . '}author_first_name' => 'author_first_name',
-							'{' . $wxr_namespace . '}author_last_name' => 'author_last_name',
-						),
-					),
-					'{' . $wxr_namespace . '}postmeta'    => array(
-						'type'   => 'post_meta',
-						'fields' => array(
-							'{' . $wxr_namespace . '}meta_key' => 'key',
-							'{' . $wxr_namespace . '}meta_value' => 'value',
-						),
-					),
-					'{' . $wxr_namespace . '}term'        => array(
-						'type'   => 'term',
-						'fields' => array(
-							'{' . $wxr_namespace . '}term_id' => 'term_id',
-							'{' . $wxr_namespace . '}term_taxonomy' => 'term_taxonomy',
-							'{' . $wxr_namespace . '}term_slug' => 'slug',
-							'{' . $wxr_namespace . '}term_parent' => 'term_parent',
-							'{' . $wxr_namespace . '}term_name' => 'term_name',
-							'{' . $wxr_namespace . '}term_description' => 'term_description',
-						),
-					),
-					'{' . $wxr_namespace . '}termmeta'    => array(
-						'type'   => 'term_meta',
-						'fields' => array(
-							'{' . $wxr_namespace . '}meta_key' => 'key',
-							'{' . $wxr_namespace . '}meta_value' => 'value',
-						),
-					),
-					'{' . $wxr_namespace . '}tag'         => array(
-						'type'   => 'tag',
-						'fields' => array(
-							'{' . $wxr_namespace . '}term_id'  => 'term_id',
-							'{' . $wxr_namespace . '}tag_slug' => 'tag_slug',
-							'{' . $wxr_namespace . '}tag_name' => 'tag_name',
-							'{' . $wxr_namespace . '}tag_description' => 'tag_description',
-						),
-					),
-					'{' . $wxr_namespace . '}category'    => array(
-						'type'   => 'category',
-						'fields' => array(
-							'{' . $wxr_namespace . '}term_id'  => 'term_id',
-							'{' . $wxr_namespace . '}category_nicename' => 'category_nicename',
-							'{' . $wxr_namespace . '}category_parent' => 'category_parent',
-							'{' . $wxr_namespace . '}cat_name' => 'cat_name',
-							'{' . $wxr_namespace . '}category_description' => 'category_description',
-						),
-					),
-				)
-			);
-		}
-		return WordPress\DataLiberation\EntityReader\WXREntityReader::create(
-			FileReadStream::from_path( $file ),
-			null,
-			array(
-				'known_site_options'        => $known_site_options,
-				'known_entities'            => $known_entities,
-				'use_legacy_post_term_keys' => true,
-				'remap_wp_author'           => false,
-			)
-		);
-	}
 }

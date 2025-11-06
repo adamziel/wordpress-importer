@@ -6,6 +6,9 @@
  * @subpackage Importer
  */
 
+use WordPress\ByteStream\ReadStream\FileReadStream;
+use WordPress\DataLiberation\EntityReader\WXREntityReader;
+use WordPress\DataLiberation\ImportEntity;
 use WordPress\DataLiberation\URL\WPURL;
 use function WordPress\DataLiberation\URL\wp_rewrite_urls;
 
@@ -51,6 +54,27 @@ class WP_Import extends WP_Importer {
 	public $options = array();
 
 	/**
+	 * Absolute path to the WXR file currently being imported.
+	 *
+	 * @var string
+	 */
+	protected $import_file = '';
+
+	/**
+	 * Streaming context for the post currently being processed.
+	 *
+	 * @var array
+	 */
+	protected $stream_post_context = array();
+
+	/**
+	 * Streaming context for the last term entity in order to attach term meta.
+	 *
+	 * @var array
+	 */
+	protected $stream_last_term_context = array();
+
+	/**
 	 * Registered callback function for the WordPress Importer
 	 *
 	 * Manages the three separate stages of the WXR import process
@@ -75,7 +99,13 @@ class WP_Import extends WP_Importer {
 				$this->id                = (int) $_POST['import_id'];
 				$file                    = get_attached_file( $this->id );
 				set_time_limit( 0 );
-				$this->import( $file, array( 'rewrite_urls' => '1' === $_POST['rewrite_urls'] ) );
+				$this->import(
+					$file,
+					array(
+						'rewrite_urls'     => isset( $_POST['rewrite_urls'] ) && '1' === $_POST['rewrite_urls'],
+						'stream_entities'  => ! empty( $_POST['stream_entities'] ),
+					)
+				);
 				break;
 		}
 
@@ -93,7 +123,8 @@ class WP_Import extends WP_Importer {
 		$options = wp_parse_args(
 			$options,
 			array(
-				'rewrite_urls' => false,
+				'rewrite_urls'    => false,
+				'stream_entities' => false,
 			)
 		);
 
@@ -129,11 +160,24 @@ class WP_Import extends WP_Importer {
 
 		$this->get_author_mapping();
 
+		$use_streaming_loop = ! empty( $this->options['stream_entities'] );
+
 		wp_suspend_cache_invalidation( true );
-		$this->process_categories();
-		$this->process_tags();
-		$this->process_terms();
-		$this->process_posts();
+		if ( $use_streaming_loop ) {
+			$streaming_success = $this->run_entity_loop();
+
+			if ( ! $streaming_success ) {
+				$this->process_categories();
+				$this->process_tags();
+				$this->process_terms();
+				$this->process_posts();
+			}
+		} else {
+			$this->process_categories();
+			$this->process_tags();
+			$this->process_terms();
+			$this->process_posts();
+		}
 		wp_suspend_cache_invalidation( false );
 
 		// update incorrect/missing information in the DB
@@ -142,6 +186,895 @@ class WP_Import extends WP_Importer {
 		$this->remap_featured_images();
 
 		$this->import_end();
+	}
+
+	/**
+	 * Processes the import payload one entity at a time using a streaming reader.
+	 *
+	 * All processing happens inside a single switch statement in order to make
+	 * the execution flow explicit and resume-friendly. This bypasses the legacy
+	 * aggregate filters (`wp_import_tags`, `wp_import_posts`, etc.) because they
+	 * require loading the full dataset into memory.
+	 *
+	 * @since 0.9.0
+	 * @return bool True when the streaming loop finished, false on failure.
+	 */
+	public function run_entity_loop() {
+		if ( empty( $this->import_file ) || ! is_readable( $this->import_file ) ) {
+			return false;
+		}
+
+		$reader = WXREntityReader::create_for_wordpress_importer( $this->import_file );
+
+		if ( ! $reader ) {
+			return false;
+		}
+
+		$this->reset_stream_state();
+
+		while ( $reader->next_entity() ) {
+			$entity = $reader->get_entity();
+
+			if ( ! $entity instanceof ImportEntity ) {
+				continue;
+			}
+
+			$data = $entity->get_data();
+
+			switch ( $entity->get_type() ) {
+				case 'site_option':
+					$this->stream_handle_site_option( $data );
+					break;
+
+				case 'user':
+					$user = $data;
+					if ( !empty( $user['user_login'] ) ) {			
+						$login = sanitize_user( $user['user_login'], true );
+				
+						$this->authors[ $login ] = array(
+							'author_id'          => isset( $user['author_id'] ) ? $user['author_id'] : null,
+							'author_login'       => $login,
+							'author_email'       => isset( $user['author_email'] ) ? $user['author_email'] : '',
+							'author_display_name'=> isset( $user['author_display_name'] ) ? $user['author_display_name'] : $login,
+							'author_first_name'  => isset( $user['author_first_name'] ) ? $user['author_first_name'] : '',
+							'author_last_name'   => isset( $user['author_last_name'] ) ? $user['author_last_name'] : '',
+						);
+					}
+					break;
+
+				case 'category':
+					$this->stream_handle_category( $data );
+					break;
+
+				case 'tag':
+					$this->stream_handle_tag( $data );
+					break;
+
+				case 'term':
+					$this->stream_handle_term( $data );
+					break;
+
+				case 'term_meta':
+					$this->stream_handle_term_meta( $data );
+					break;
+
+				case 'post':
+					$this->stream_handle_post( $data );
+					break;
+
+				case 'post_meta':
+					$this->stream_handle_post_meta( $data );
+					break;
+
+				case 'comment':
+					$this->stream_handle_comment( $data );
+					break;
+
+				case 'comment_meta':
+					$this->stream_handle_comment_meta( $data );
+					break;
+
+				default:
+					if ( 'wxr_version' === $entity->get_type() && isset( $data['wxr_version'] ) ) {
+						$this->version = $data['wxr_version'];
+					}
+					break;
+			}
+
+		}
+
+		$this->finalize_stream_post_context();
+		$this->finalize_stream_term_meta();
+
+		return true;
+	}
+
+	/**
+	 * Creates a streaming WXR reader with field mappings compatible with the legacy importer.
+	 *
+	 * @param string $file Absolute path to the WXR file.
+	 * @return WXREntityReader|false
+	 */
+	protected function create_streaming_entity_reader( $file ) {
+		$wxr_namespaces = array(
+			'http://wordpress.org/export/1.0/',
+			'https://wordpress.org/export/1.0/',
+			'http://wordpress.org/export/1.1/',
+			'https://wordpress.org/export/1.1/',
+			'http://wordpress.org/export/1.2/',
+			'https://wordpress.org/export/1.2/',
+		);
+
+		$known_entities = array(
+			'item' => array(
+				'type'   => 'post',
+				'fields' => array(
+					'title'       => 'post_title',
+					'guid'        => 'guid',
+					'description' => 'post_excerpt',
+					'{http://purl.org/dc/elements/1.1/}creator'            => 'post_author',
+					'{http://purl.org/rss/1.0/modules/content/}encoded'    => 'post_content',
+					'{http://wordpress.org/export/1.0/excerpt/}encoded'    => 'post_excerpt',
+					'{http://wordpress.org/export/1.1/excerpt/}encoded'    => 'post_excerpt',
+					'{http://wordpress.org/export/1.2/excerpt/}encoded'    => 'post_excerpt',
+				),
+			),
+		);
+
+		$known_site_options = array();
+
+		foreach ( $wxr_namespaces as $wxr_namespace ) {
+			$known_site_options = array_merge(
+				$known_site_options,
+				array(
+					'{' . $wxr_namespace . '}base_blog_url' => 'home',
+					'{' . $wxr_namespace . '}base_site_url' => 'siteurl',
+					'{' . $wxr_namespace . '}wxr_version'   => 'wxr_version',
+					'title'                                 => 'blogname',
+				)
+			);
+
+			$known_entities['item']['fields'] = array_merge(
+				$known_entities['item']['fields'],
+				array(
+					'{' . $wxr_namespace . '}post_id'            => 'post_id',
+					'{' . $wxr_namespace . '}status'             => 'status',
+					'{' . $wxr_namespace . '}post_date'          => 'post_date',
+					'{' . $wxr_namespace . '}post_date_gmt'      => 'post_date_gmt',
+					'{' . $wxr_namespace . '}post_modified'      => 'post_modified',
+					'{' . $wxr_namespace . '}post_modified_gmt'  => 'post_modified_gmt',
+					'{' . $wxr_namespace . '}comment_status'     => 'comment_status',
+					'{' . $wxr_namespace . '}ping_status'        => 'ping_status',
+					'{' . $wxr_namespace . '}post_name'          => 'post_name',
+					'{' . $wxr_namespace . '}post_parent'        => 'post_parent',
+					'{' . $wxr_namespace . '}menu_order'         => 'menu_order',
+					'{' . $wxr_namespace . '}post_type'          => 'post_type',
+					'{' . $wxr_namespace . '}post_password'      => 'post_password',
+					'{' . $wxr_namespace . '}is_sticky'          => 'is_sticky',
+					'{' . $wxr_namespace . '}attachment_url'     => 'attachment_url',
+				)
+			);
+
+			$known_entities = array_merge(
+				$known_entities,
+				array(
+					'{' . $wxr_namespace . '}comment'     => array(
+						'type'   => 'comment',
+						'fields' => array(
+							'{' . $wxr_namespace . '}comment_id'        => 'comment_id',
+							'{' . $wxr_namespace . '}comment_author'    => 'comment_author',
+							'{' . $wxr_namespace . '}comment_author_email' => 'comment_author_email',
+							'{' . $wxr_namespace . '}comment_author_url'   => 'comment_author_url',
+							'{' . $wxr_namespace . '}comment_author_IP'    => 'comment_author_IP',
+							'{' . $wxr_namespace . '}comment_date'         => 'comment_date',
+							'{' . $wxr_namespace . '}comment_date_gmt'     => 'comment_date_gmt',
+							'{' . $wxr_namespace . '}comment_content'      => 'comment_content',
+							'{' . $wxr_namespace . '}comment_approved'     => 'comment_approved',
+							'{' . $wxr_namespace . '}comment_type'         => 'comment_type',
+							'{' . $wxr_namespace . '}comment_parent'       => 'comment_parent',
+							'{' . $wxr_namespace . '}comment_user_id'      => 'comment_user_id',
+						),
+					),
+					'{' . $wxr_namespace . '}commentmeta' => array(
+						'type'   => 'comment_meta',
+						'fields' => array(
+							'{' . $wxr_namespace . '}meta_key'   => 'key',
+							'{' . $wxr_namespace . '}meta_value' => 'value',
+						),
+					),
+					'{' . $wxr_namespace . '}author'      => array(
+						'type'   => 'user',
+						'fields' => array(
+							'{' . $wxr_namespace . '}author_id'         => 'author_id',
+							'{' . $wxr_namespace . '}author_login'      => 'author_login',
+							'{' . $wxr_namespace . '}author_email'      => 'author_email',
+							'{' . $wxr_namespace . '}author_display_name' => 'author_display_name',
+							'{' . $wxr_namespace . '}author_first_name' => 'author_first_name',
+							'{' . $wxr_namespace . '}author_last_name'  => 'author_last_name',
+						),
+					),
+					'{' . $wxr_namespace . '}postmeta'    => array(
+						'type'   => 'post_meta',
+						'fields' => array(
+							'{' . $wxr_namespace . '}meta_key'   => 'key',
+							'{' . $wxr_namespace . '}meta_value' => 'value',
+						),
+					),
+					'{' . $wxr_namespace . '}term'        => array(
+						'type'   => 'term',
+						'fields' => array(
+							'{' . $wxr_namespace . '}term_id'          => 'term_id',
+							'{' . $wxr_namespace . '}term_taxonomy'    => 'term_taxonomy',
+							'{' . $wxr_namespace . '}term_slug'        => 'term_slug',
+							'{' . $wxr_namespace . '}term_parent'      => 'term_parent',
+							'{' . $wxr_namespace . '}term_name'        => 'term_name',
+							'{' . $wxr_namespace . '}term_description' => 'term_description',
+						),
+					),
+					'{' . $wxr_namespace . '}termmeta'    => array(
+						'type'   => 'term_meta',
+						'fields' => array(
+							'{' . $wxr_namespace . '}meta_key'   => 'key',
+							'{' . $wxr_namespace . '}meta_value' => 'value',
+						),
+					),
+					'{' . $wxr_namespace . '}tag'         => array(
+						'type'   => 'tag',
+						'fields' => array(
+							'{' . $wxr_namespace . '}term_id'          => 'term_id',
+							'{' . $wxr_namespace . '}tag_slug'         => 'tag_slug',
+							'{' . $wxr_namespace . '}tag_name'         => 'tag_name',
+							'{' . $wxr_namespace . '}tag_description'  => 'tag_description',
+						),
+					),
+					'{' . $wxr_namespace . '}category'    => array(
+						'type'   => 'category',
+						'fields' => array(
+							'{' . $wxr_namespace . '}term_id'             => 'term_id',
+							'{' . $wxr_namespace . '}category_nicename'   => 'category_nicename',
+							'{' . $wxr_namespace . '}category_parent'     => 'category_parent',
+							'{' . $wxr_namespace . '}cat_name'            => 'cat_name',
+							'{' . $wxr_namespace . '}category_description' => 'category_description',
+						),
+					),
+				)
+			);
+		}
+
+		try {
+			return WXREntityReader::create(
+				FileReadStream::from_path( $file ),
+				null,
+				array(
+					'known_site_options'        => $known_site_options,
+					'known_entities'            => $known_entities,
+					'use_legacy_post_term_keys' => true,
+					'remap_wp_author'           => false,
+				)
+			);
+		} catch ( \Exception $e ) {
+			return false;
+		}
+	}
+
+	/**
+	 * Resets all streaming state.
+	 */
+	protected function reset_stream_state() {
+		$this->stream_post_context      = $this->empty_stream_post_context();
+		$this->stream_last_term_context = array();
+	}
+
+	/**
+	 * Provides the default structure for the streaming post context.
+	 *
+	 * @return array
+	 */
+	protected function empty_stream_post_context() {
+		return array(
+			'post'                 => null,
+			'post_id'              => 0,
+			'comment_post_id'      => 0,
+			'post_exists'          => false,
+			'comment_id_map'       => array(),
+			'pending_comments'     => array(),
+			'pending_comment_meta' => array(),
+		);
+	}
+
+	/**
+	 * Flushes any remaining state attached to the current streamed post.
+	 */
+	protected function finalize_stream_post_context() {
+		if ( empty( $this->stream_post_context ) ) {
+			$this->stream_post_context = $this->empty_stream_post_context();
+			return;
+		}
+
+		$this->stream_process_pending_comments();
+		$this->stream_post_context = $this->empty_stream_post_context();
+	}
+
+	/**
+	 * Applies any queued term meta for the last streamed term.
+	 */
+	protected function finalize_stream_term_meta() {
+		if ( empty( $this->stream_last_term_context ) ) {
+			return;
+		}
+
+		if (
+			empty( $this->stream_last_term_context['termmeta'] ) ||
+			empty( $this->stream_last_term_context['processed']['created'] )
+		) {
+			$this->stream_last_term_context = array();
+			return;
+		}
+
+		$term                         = $this->stream_last_term_context['term'];
+		$term['termmeta']             = $this->stream_last_term_context['termmeta'];
+		$processed_term_id            = $this->stream_last_term_context['processed']['term_id'];
+		$this->stream_last_term_context = array();
+
+		$this->process_termmeta( $term, $processed_term_id );
+	}
+
+	/**
+	 * Handles site option entities to capture base URL and WXR version information.
+	 *
+	 * @param array $option Option entity data.
+	 */
+	protected function stream_handle_site_option( $option ) {
+		if ( empty( $option['option_name'] ) ) {
+			return;
+		}
+
+		switch ( $option['option_name'] ) {
+			case 'wxr_version':
+				$this->version = $option['option_value'];
+				break;
+			case 'siteurl':
+				$this->base_url = esc_url( $option['option_value'] );
+				$base_url_with_trailing_slash = rtrim( $this->base_url, '/' ) . '/';
+				$this->base_url_parsed        = WPURL::parse( $base_url_with_trailing_slash );
+				break;
+			case 'home':
+				if ( empty( $this->base_url ) ) {
+					$this->base_url = esc_url( $option['option_value'] );
+					$base_url_with_trailing_slash = rtrim( $this->base_url, '/' ) . '/';
+					$this->base_url_parsed        = WPURL::parse( $base_url_with_trailing_slash );
+				}
+				break;
+		}
+
+		if ( ! $this->site_url_parsed ) {
+			$site_url_with_trailing_slash = rtrim( get_site_url(), '/' ) . '/';
+			$this->site_url_parsed        = WPURL::parse( $site_url_with_trailing_slash );
+		}
+	}
+
+	/**
+	 * Streams a category entity directly into {@see process_category()}.
+	 *
+	 * @param array $data Category entity data.
+	 */
+	protected function stream_handle_category( $data ) {
+		$this->finalize_stream_term_meta();
+
+		$category = array(
+			'category_nicename'    => isset( $data['category_nicename'] ) ? $data['category_nicename'] : ( isset( $data['slug'] ) ? $data['slug'] : '' ),
+			'category_parent'      => isset( $data['category_parent'] ) ? $data['category_parent'] : ( isset( $data['parent'] ) ? $data['parent'] : '' ),
+			'cat_name'             => isset( $data['cat_name'] ) ? $data['cat_name'] : ( isset( $data['name'] ) ? $data['name'] : '' ),
+			'category_description' => isset( $data['category_description'] ) ? $data['category_description'] : ( isset( $data['description'] ) ? $data['description'] : '' ),
+		);
+
+		if ( isset( $data['term_id'] ) ) {
+			$category['term_id'] = $data['term_id'];
+		}
+
+		$processed_category = $this->process_category( $category );
+
+		if ( false === $processed_category ) {
+			$this->stream_last_term_context = array();
+			return;
+		}
+
+		if ( isset( $category['term_id'] ) ) {
+			$this->processed_terms[ intval( $category['term_id'] ) ] = $processed_category['term_id'];
+		}
+
+		$this->stream_last_term_context = array(
+			'term'      => $category,
+			'processed' => $processed_category,
+			'termmeta'  => array(),
+		);
+	}
+
+	/**
+	 * Streams a tag entity directly into {@see process_tag()}.
+	 *
+	 * @param array $data Tag entity data.
+	 */
+	protected function stream_handle_tag( $data ) {
+		$this->finalize_stream_term_meta();
+
+		$tag = array(
+			'tag_slug'        => isset( $data['tag_slug'] ) ? $data['tag_slug'] : ( isset( $data['slug'] ) ? $data['slug'] : '' ),
+			'tag_name'        => isset( $data['tag_name'] ) ? $data['tag_name'] : ( isset( $data['name'] ) ? $data['name'] : '' ),
+			'tag_description' => isset( $data['tag_description'] ) ? $data['tag_description'] : ( isset( $data['description'] ) ? $data['description'] : '' ),
+		);
+
+		if ( isset( $data['term_id'] ) ) {
+			$tag['term_id'] = $data['term_id'];
+		}
+
+		$processed_tag = $this->process_tag( $tag );
+
+		if ( false === $processed_tag ) {
+			$this->stream_last_term_context = array();
+			return;
+		}
+
+		if ( isset( $tag['term_id'] ) ) {
+			$this->processed_terms[ intval( $tag['term_id'] ) ] = $processed_tag['term_id'];
+		}
+
+		$this->stream_last_term_context = array(
+			'term'      => $tag,
+			'processed' => $processed_tag,
+			'termmeta'  => array(),
+		);
+	}
+
+	/**
+	 * Streams a generic term entity into {@see process_term()}.
+	 *
+	 * @param array $data Term entity data.
+	 */
+	protected function stream_handle_term( $data ) {
+		$this->finalize_stream_term_meta();
+
+		$term = array(
+			'term_id'          => isset( $data['term_id'] ) ? $data['term_id'] : ( isset( $data['ID'] ) ? $data['ID'] : 0 ),
+			'term_taxonomy'    => isset( $data['term_taxonomy'] ) ? $data['term_taxonomy'] : ( isset( $data['taxonomy'] ) ? $data['taxonomy'] : '' ),
+			'term_slug'        => isset( $data['term_slug'] ) ? $data['term_slug'] : ( isset( $data['slug'] ) ? $data['slug'] : '' ),
+			'term_parent'      => isset( $data['term_parent'] ) ? $data['term_parent'] : ( isset( $data['parent'] ) ? $data['parent'] : '' ),
+			'term_name'        => isset( $data['term_name'] ) ? $data['term_name'] : ( isset( $data['name'] ) ? $data['name'] : '' ),
+			'term_description' => isset( $data['term_description'] ) ? $data['term_description'] : ( isset( $data['description'] ) ? $data['description'] : '' ),
+		);
+
+		$processed_term = $this->process_term( $term );
+
+		if ( false === $processed_term ) {
+			$this->stream_last_term_context = array();
+			return;
+		}
+
+		if ( isset( $term['term_id'] ) ) {
+			$this->processed_terms[ intval( $term['term_id'] ) ] = $processed_term['term_id'];
+		}
+
+		$this->stream_last_term_context = array(
+			'term'      => $term,
+			'processed' => $processed_term,
+			'termmeta'  => array(),
+		);
+	}
+
+	/**
+	 * Accumulates term meta emitted after a term entity.
+	 *
+	 * @param array $data Term meta entity data.
+	 */
+	protected function stream_handle_term_meta( $data ) {
+		if ( empty( $this->stream_last_term_context ) ) {
+			return;
+		}
+
+		$key = isset( $data['key'] ) ? $data['key'] : ( isset( $data['meta_key'] ) ? $data['meta_key'] : null );
+
+		if ( ! $key ) {
+			return;
+		}
+
+		$this->stream_last_term_context['termmeta'][] = array(
+			'key'   => $key,
+			'value' => isset( $data['value'] ) ? $data['value'] : ( isset( $data['meta_value'] ) ? $data['meta_value'] : '' ),
+		);
+	}
+
+	/**
+	 * Handles a post entity by importing the post and preparing streaming context.
+	 *
+	 * @param array $data Post entity data.
+	 */
+	protected function stream_handle_post( $data ) {
+		$this->finalize_stream_post_context();
+
+		$post = $this->stream_normalize_post_array( $data );
+
+		$post = apply_filters( 'wp_import_post_data_raw', $post );
+
+		if ( ! post_type_exists( $post['post_type'] ) ) {
+			printf(
+				__( 'Failed to import &#8220;%1$s&#8221;: Invalid post type %2$s', 'wordpress-importer' ),
+				esc_html( $post['post_title'] ),
+				esc_html( $post['post_type'] )
+			);
+			echo '<br />';
+			do_action( 'wp_import_post_exists', $post );
+
+			$this->stream_post_context = $this->empty_stream_post_context();
+			return;
+		}
+
+		if ( isset( $this->processed_posts[ $post['post_id'] ] ) && ! empty( $post['post_id'] ) ) {
+			$this->stream_post_context = $this->empty_stream_post_context();
+			return;
+		}
+
+		if ( 'auto-draft' === $post['status'] ) {
+			$this->stream_post_context = $this->empty_stream_post_context();
+			return;
+		}
+
+		if ( 'nav_menu_item' === $post['post_type'] ) {
+			$this->process_menu_item( $post );
+			$this->stream_post_context = $this->empty_stream_post_context();
+			return;
+		}
+
+		$post_type_object = get_post_type_object( $post['post_type'] );
+
+		if ( ! $post_type_object ) {
+			$this->stream_post_context = $this->empty_stream_post_context();
+			return;
+		}
+
+		$this->stream_convert_post_terms( $post );
+
+		$processed_post = $this->process_post( $post, $post_type_object );
+
+		if ( ! $processed_post ) {
+			$this->stream_post_context = $this->empty_stream_post_context();
+			return;
+		}
+
+		$post_id         = $processed_post['post_id'];
+		$comment_post_id = $processed_post['comment_post_id'];
+		$post_exists     = (bool) $processed_post['post_exists'];
+
+		$terms = isset( $post['terms'] ) ? $post['terms'] : array();
+		$terms = apply_filters( 'wp_import_post_terms', $terms, $post_id, $post );
+
+		if ( ! empty( $terms ) ) {
+			$this->process_post_terms( $terms, $post_id, $post );
+		}
+
+		$this->stream_post_context = array(
+			'post'                 => $post,
+			'post_id'              => $post_id,
+			'comment_post_id'      => $comment_post_id,
+			'post_exists'          => $post_exists,
+			'comment_id_map'       => array(),
+			'pending_comments'     => array(),
+			'pending_comment_meta' => array(),
+		);
+	}
+
+	/**
+	 * Ensures post entity data matches the legacy importer expectations.
+	 *
+	 * @param array $post Raw post array from the entity reader.
+	 * @return array Normalized post array.
+	 */
+	protected function stream_normalize_post_array( array $post ) {
+		if ( isset( $post['post_status'] ) && ! isset( $post['status'] ) ) {
+			$post['status'] = $post['post_status'];
+		}
+
+		$defaults = array(
+			'post_title'     => '',
+			'post_content'   => '',
+			'post_excerpt'   => '',
+			'post_author'    => '',
+			'post_date'      => '',
+			'post_date_gmt'  => '',
+			'comment_status' => 'open',
+			'ping_status'    => 'open',
+			'post_name'      => '',
+			'post_status'    => '',
+			'status'         => '',
+			'post_parent'    => 0,
+			'menu_order'     => 0,
+			'post_type'      => 'post',
+			'post_password'  => '',
+			'post_id'        => 0,
+			'is_sticky'      => 0,
+			'guid'           => isset( $post['guid'] ) ? $post['guid'] : ( isset( $post['link'] ) ? $post['link'] : '' ),
+		);
+
+		return array_merge( $defaults, $post );
+	}
+
+	/**
+	 * Converts per-post term structures to the legacy shape expected by {@see process_post_terms()}.
+	 *
+	 * @param array $post Post array passed by reference.
+	 */
+	protected function stream_convert_post_terms( array &$post ) {
+		if ( ! isset( $post['terms'] ) || ! is_array( $post['terms'] ) ) {
+			return;
+		}
+
+		foreach ( $post['terms'] as $index => $term ) {
+			if ( isset( $term['domain'] ) ) {
+				continue;
+			}
+
+			if ( isset( $term['taxonomy'] ) ) {
+				$post['terms'][ $index ] = array(
+					'domain' => $term['taxonomy'],
+					'slug'   => isset( $term['slug'] ) ? $term['slug'] : '',
+					'name'   => isset( $term['description'] ) ? $term['description'] : '',
+				);
+			}
+		}
+	}
+
+	/**
+	 * Processes post meta entities as they are streamed.
+	 *
+	 * @param array $data Post meta entity data.
+	 */
+	protected function stream_handle_post_meta( $data ) {
+		if ( empty( $this->stream_post_context['post_id'] ) ) {
+			return;
+		}
+
+		$key = isset( $data['key'] ) ? $data['key'] : ( isset( $data['meta_key'] ) ? $data['meta_key'] : null );
+
+		if ( ! $key ) {
+			return;
+		}
+
+		$meta = array(
+			'key'   => $key,
+			'value' => isset( $data['value'] ) ? $data['value'] : ( isset( $data['meta_value'] ) ? $data['meta_value'] : '' ),
+		);
+
+		$this->process_post_meta( $meta, $this->stream_post_context['post_id'], $this->stream_post_context['post'] );
+	}
+
+	/**
+	 * Handles comment entities during streaming.
+	 *
+	 * @param array $data Comment entity data.
+	 */
+	protected function stream_handle_comment( $data ) {
+		if ( empty( $this->stream_post_context['post_id'] ) ) {
+			return;
+		}
+
+		$original_id = isset( $data['comment_id'] ) ? intval( $data['comment_id'] ) : null;
+
+		$comment = array(
+			'comment_post_ID'      => $this->stream_post_context['comment_post_id'],
+			'comment_author'       => isset( $data['comment_author'] ) ? $data['comment_author'] : '',
+			'comment_author_email' => isset( $data['comment_author_email'] ) ? $data['comment_author_email'] : '',
+			'comment_author_url'   => isset( $data['comment_author_url'] ) ? $data['comment_author_url'] : '',
+			'comment_author_IP'    => isset( $data['comment_author_IP'] ) ? $data['comment_author_IP'] : '',
+			'comment_date'         => isset( $data['comment_date'] ) ? $data['comment_date'] : '',
+			'comment_date_gmt'     => isset( $data['comment_date_gmt'] ) ? $data['comment_date_gmt'] : '',
+			'comment_content'      => isset( $data['comment_content'] ) ? $data['comment_content'] : '',
+			'comment_approved'     => isset( $data['comment_approved'] ) ? $data['comment_approved'] : 1,
+			'comment_type'         => isset( $data['comment_type'] ) ? $data['comment_type'] : '',
+			'comment_parent'       => isset( $data['comment_parent'] ) ? (int) $data['comment_parent'] : 0,
+			'commentmeta'          => array(),
+		);
+
+		if ( isset( $data['comment_user_id'] ) && isset( $this->processed_authors[ $data['comment_user_id'] ] ) ) {
+			$comment['user_id'] = $this->processed_authors[ $data['comment_user_id'] ];
+		}
+
+		if ( $comment['comment_parent'] && ! isset( $this->stream_post_context['comment_id_map'][ $comment['comment_parent'] ] ) ) {
+			$this->stream_post_context['pending_comments'][] = array(
+				'original_id' => $original_id,
+				'comment'     => $comment,
+			);
+			return;
+		}
+
+		if ( $comment['comment_parent'] && isset( $this->stream_post_context['comment_id_map'][ $comment['comment_parent'] ] ) ) {
+			$comment['comment_parent'] = $this->stream_post_context['comment_id_map'][ $comment['comment_parent'] ];
+		}
+
+		$inserted_comment_id = $this->stream_insert_comment( $comment, $original_id );
+
+		if ( $inserted_comment_id ) {
+			$this->stream_process_pending_comments();
+		}
+	}
+
+	/**
+	 * Inserts a comment and records the mapping from original to imported ID.
+	 *
+	 * @param array   $comment           Comment array prepared for insertion.
+	 * @param int|nul $original_comment_id Original comment ID from the WXR file.
+	 * @return int|false Inserted comment ID on success, false otherwise.
+	 */
+	protected function stream_insert_comment( array $comment, $original_comment_id ) {
+		$inserted_comment_id = $this->process_post_comment(
+			$comment,
+			(bool) $this->stream_post_context['post_exists'],
+			$this->stream_post_context['comment_post_id']
+		);
+
+		if ( $inserted_comment_id ) {
+			if ( null !== $original_comment_id ) {
+				$this->stream_post_context['comment_id_map'][ $original_comment_id ] = $inserted_comment_id;
+			}
+
+			do_action( 'wp_import_insert_comment', $inserted_comment_id, $comment, $this->stream_post_context['comment_post_id'], $this->stream_post_context['post'] );
+
+			if ( null !== $original_comment_id ) {
+				$this->stream_apply_pending_comment_meta( $original_comment_id, $inserted_comment_id );
+			}
+		}
+
+		return $inserted_comment_id;
+	}
+
+	/**
+	 * Applies any queued comment meta entries once the comment has been inserted.
+	 *
+	 * @param int $original_comment_id Original comment ID.
+	 * @param int $inserted_comment_id Inserted comment ID.
+	 */
+	protected function stream_apply_pending_comment_meta( $original_comment_id, $inserted_comment_id ) {
+		if ( empty( $this->stream_post_context['pending_comment_meta'][ $original_comment_id ] ) ) {
+			return;
+		}
+
+		$meta = $this->stream_post_context['pending_comment_meta'][ $original_comment_id ];
+		unset( $this->stream_post_context['pending_comment_meta'][ $original_comment_id ] );
+
+		$this->process_post_comment_metas( $inserted_comment_id, $meta );
+	}
+
+	/**
+	 * Attempts to insert any queued comments whose parents have since been imported.
+	 */
+	protected function stream_process_pending_comments() {
+		if ( empty( $this->stream_post_context['pending_comments'] ) ) {
+			return;
+		}
+
+		$made_progress = true;
+
+		while ( $made_progress && ! empty( $this->stream_post_context['pending_comments'] ) ) {
+			$made_progress = false;
+
+			foreach ( $this->stream_post_context['pending_comments'] as $index => $pending ) {
+				$parent = isset( $pending['comment']['comment_parent'] ) ? (int) $pending['comment']['comment_parent'] : 0;
+
+				if ( 0 !== $parent && ! isset( $this->stream_post_context['comment_id_map'][ $parent ] ) ) {
+					continue;
+				}
+
+				if ( $parent && isset( $this->stream_post_context['comment_id_map'][ $parent ] ) ) {
+					$pending['comment']['comment_parent'] = $this->stream_post_context['comment_id_map'][ $parent ];
+				} else {
+					$pending['comment']['comment_parent'] = 0;
+				}
+
+				$this->stream_insert_comment( $pending['comment'], $pending['original_id'] );
+				unset( $this->stream_post_context['pending_comments'][ $index ] );
+				$made_progress = true;
+			}
+		}
+
+		if ( ! empty( $this->stream_post_context['pending_comments'] ) ) {
+			// Drop any remaining comments with unresolved parents.
+			$this->stream_post_context['pending_comments'] = array();
+		}
+	}
+
+	/**
+	 * Handles comment meta entities for streamed comments.
+	 *
+	 * @param array $data Comment meta entity data.
+	 */
+	protected function stream_handle_comment_meta( $data ) {
+		if ( empty( $this->stream_post_context['post_id'] ) ) {
+			return;
+		}
+
+		$original_comment_id = isset( $data['comment_id'] ) ? intval( $data['comment_id'] ) : null;
+		$key                 = isset( $data['key'] ) ? $data['key'] : ( isset( $data['meta_key'] ) ? $data['meta_key'] : null );
+
+		if ( null === $original_comment_id || ! $key ) {
+			return;
+		}
+
+		$meta = array(
+			'key'   => $key,
+			'value' => isset( $data['value'] ) ? $data['value'] : ( isset( $data['meta_value'] ) ? $data['meta_value'] : '' ),
+		);
+
+		if ( isset( $this->stream_post_context['comment_id_map'][ $original_comment_id ] ) ) {
+			$this->process_post_comment_meta( $this->stream_post_context['comment_id_map'][ $original_comment_id ], $meta );
+			return;
+		}
+
+		if ( ! isset( $this->stream_post_context['pending_comment_meta'][ $original_comment_id ] ) ) {
+			$this->stream_post_context['pending_comment_meta'][ $original_comment_id ] = array();
+		}
+
+		$this->stream_post_context['pending_comment_meta'][ $original_comment_id ][] = $meta;
+	}
+
+	/**
+	 * Imports a single post record along with its related data.
+	 *
+	 * @param array $post Normalized post array from the WXR file.
+	 */
+	protected function import_post_record( array $post ) {
+		if ( ! post_type_exists( $post['post_type'] ) ) {
+			printf(
+				__( 'Failed to import &#8220;%1$s&#8221;: Invalid post type %2$s', 'wordpress-importer' ),
+				esc_html( $post['post_title'] ),
+				esc_html( $post['post_type'] )
+			);
+			echo '<br />';
+			do_action( 'wp_import_post_exists', $post );
+			return;
+		}
+
+		if ( isset( $this->processed_posts[ $post['post_id'] ] ) && ! empty( $post['post_id'] ) ) {
+			return;
+		}
+
+		if ( 'auto-draft' === $post['status'] ) {
+			return;
+		}
+
+		if ( 'nav_menu_item' === $post['post_type'] ) {
+			$this->process_menu_item( $post );
+			return;
+		}
+
+		$post_type_object = get_post_type_object( $post['post_type'] );
+		if ( ! $post_type_object ) {
+			return;
+		}
+
+		$processed_post = $this->process_post( $post, $post_type_object );
+		if ( ! $processed_post ) {
+			return;
+		}
+
+		$post_id         = $processed_post['post_id'];
+		$comment_post_id = $processed_post['comment_post_id'];
+		$post_exists     = $processed_post['post_exists'];
+
+		$terms = isset( $post['terms'] ) ? $post['terms'] : array();
+		$terms = apply_filters( 'wp_import_post_terms', $terms, $post_id, $post );
+		if ( ! empty( $terms ) ) {
+			$this->process_post_terms( $terms, $post_id, $post );
+			unset( $post['terms'] );
+		}
+
+		$comments = isset( $post['comments'] ) ? $post['comments'] : array();
+		$comments = apply_filters( 'wp_import_post_comments', $comments, $post_id, $post );
+		if ( ! empty( $comments ) ) {
+			$this->process_post_comments( $comments, (bool) $post_exists, $comment_post_id, $post );
+			unset( $post['comments'] );
+		}
+
+		$postmeta = isset( $post['postmeta'] ) ? $post['postmeta'] : array();
+		$postmeta = apply_filters( 'wp_import_post_meta', $postmeta, $post_id, $post );
+		$this->process_post_metas( $postmeta, $post_id, $post );
 	}
 
 	/**
@@ -156,6 +1089,8 @@ class WP_Import extends WP_Importer {
 			$this->footer();
 			die();
 		}
+
+		$this->import_file = $file;
 
 		$import_data = $this->parse( $file );
 
@@ -336,6 +1271,11 @@ class WP_Import extends WP_Importer {
 	<p>
 		<input type="checkbox" value="1" name="rewrite_urls" id="rewrite-urls" checked="checked" />
 		<label for="rewrite-urls"><?php _e( 'Change all imported URLs that currently link to the previous site so that they now link to this site', 'wordpress-importer' ); ?></label>
+	</p>
+
+	<p>
+		<input type="checkbox" value="1" name="stream_entities" id="stream-entities" />
+		<label for="stream-entities"><?php _e( 'Process the WXR file using the streaming entity loop (experimental, helps resume large imports)', 'wordpress-importer' ); ?></label>
 	</p>
 
 	<p class="submit"><input type="submit" class="button" value="<?php esc_attr_e( 'Submit', 'wordpress-importer' ); ?>" /></p>
@@ -759,75 +1699,7 @@ class WP_Import extends WP_Importer {
 
 		foreach ( $this->posts as $post ) {
 			$post = apply_filters( 'wp_import_post_data_raw', $post );
-
-			if ( ! post_type_exists( $post['post_type'] ) ) {
-				printf(
-					__( 'Failed to import &#8220;%1$s&#8221;: Invalid post type %2$s', 'wordpress-importer' ),
-					esc_html( $post['post_title'] ),
-					esc_html( $post['post_type'] )
-				);
-				echo '<br />';
-				do_action( 'wp_import_post_exists', $post );
-				continue;
-			}
-
-			if ( isset( $this->processed_posts[ $post['post_id'] ] ) && ! empty( $post['post_id'] ) ) {
-				continue;
-			}
-
-			if ( 'auto-draft' == $post['status'] ) {
-				continue;
-			}
-
-			if ( 'nav_menu_item' == $post['post_type'] ) {
-				$this->process_menu_item( $post );
-				continue;
-			}
-
-			$post_type_object = get_post_type_object( $post['post_type'] );
-
-			$processed_post = $this->process_post( $post, $post_type_object );
-
-			if ( ! $processed_post ) {
-				continue;
-			}
-
-			$post_id         = $processed_post['post_id'];
-			$comment_post_id = $processed_post['comment_post_id'];
-			$post_exists     = $processed_post['post_exists'];
-
-			if ( ! isset( $post['terms'] ) ) {
-				$post['terms'] = array();
-			}
-
-			$post['terms'] = apply_filters( 'wp_import_post_terms', $post['terms'], $post_id, $post );
-
-			// add categories, tags and other terms
-			if ( ! empty( $post['terms'] ) ) {
-				$this->process_post_terms( $post['terms'], $post_id, $post );
-				unset( $post['terms'] );
-			}
-
-			if ( ! isset( $post['comments'] ) ) {
-				$post['comments'] = array();
-			}
-
-			$post['comments'] = apply_filters( 'wp_import_post_comments', $post['comments'], $post_id, $post );
-
-			// add/update comments
-			if ( ! empty( $post['comments'] ) ) {
-				$this->process_post_comments( $post['comments'], (bool) $post_exists, $comment_post_id, $post );
-				unset( $post['comments'] );
-			}
-
-			if ( ! isset( $post['postmeta'] ) ) {
-				$post['postmeta'] = array();
-			}
-
-			$post['postmeta'] = apply_filters( 'wp_import_post_meta', $post['postmeta'], $post_id, $post );
-
-			// add/update post meta
-			$this->process_post_metas( $post['postmeta'], $post_id, $post );
+			$this->import_post_record( $post );
 		}
 
 		unset( $this->posts );

@@ -453,12 +453,91 @@ async function startPlayground(parser = null) {
 	return { url: siteUrl, stop };
 }
 
+test.describe('Streaming Entity Loop', () => {
+	test('imports a simple WXR file using the streaming loop', async ({ page }) => {
+		await withPlaygroundServer(async () => {
+			await runWxrImport(page, 'wxr-simple.xml', { streamEntities: true });
+
+			const posts = await getPostsEdit(page, 'Road Not Taken');
+			expect(posts.length).toBeGreaterThan(0);
+			const post = findPostByTitle(posts, 'The Road Not Taken');
+			expect(post).toBeTruthy();
+
+			const normalized = normalizePostData(post);
+			expect(normalized).toMatchObject({
+				status: 'publish',
+				type: 'post',
+				sticky: false,
+				title: expect.stringContaining('The Road Not Taken'),
+				categories: expect.arrayContaining(['uncategorized']),
+			});
+
+			await goToPostFrontend(page, post);
+			await expect(page.getByText('Two roads diverged in a yellow wood')).toBeVisible();
+		});
+	});
+
+	test.only('imports the comprehensive WXR fixture using the streaming loop', async ({
+		page,
+	}) => {
+		await withPlaygroundServer(async () => {
+			await runWxrImport(page, 'wxr-comprehensive.xml', { streamEntities: true });
+
+			const posts = await getPostsEdit(page, 'Comprehensive Post');
+			expect(posts.length).toBeGreaterThan(0);
+			const comprehensivePost = findPostByTitle(posts, 'Comprehensive Post');
+
+			const postTerms = (comprehensivePost?._embedded?.['wp:term'] || [])
+				.flat()
+				.filter(Boolean);
+			const tagSlugs = postTerms
+				.filter((term) => term.taxonomy === 'post_tag')
+				.map((term) => (term.slug || term.name || '').toString().toLowerCase());
+
+			const normalizedPost = normalizePostData(comprehensivePost);
+			expect(normalizedPost).toMatchObject({
+				status: 'publish',
+				type: 'post',
+				title: expect.stringContaining('Comprehensive Post'),
+				categories: expect.arrayContaining(['news', 'updates']),
+				comment_status: 'open',
+			});
+			expect(tagSlugs).toEqual(expect.arrayContaining(['t1', 't2']));
+
+			const commentsResponse = await page.request.get(
+				abs(`/wp-json/wp/v2/comments?post=${comprehensivePost.id}`)
+			);
+			expect(commentsResponse.ok()).toBeTruthy();
+			const comments = await commentsResponse.json();
+			expect(comments).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({
+						content: expect.objectContaining({
+							rendered: expect.stringContaining('Great post!'),
+						}),
+					}),
+				])
+			);
+
+			const pages = await getPagesEdit(page, 'Comprehensive Page');
+			expect(pages.length).toBeGreaterThan(0);
+			const comprehensivePage = findPostByTitle(pages, 'Comprehensive Page');
+			const normalizedPage = normalizePostData(comprehensivePage);
+			expect(normalizedPage).toMatchObject({
+				type: 'page',
+				comment_status: 'closed',
+				title: expect.stringContaining('Comprehensive Page'),
+			});
+		});
+	});
+});
+
 function abs(u) {
 	return `${PLAYGROUND_URL}${u}`;
 }
 
 // Helper: Run WXR import process
-async function runWxrImport(page, filename, { rewriteUrls = true } = {}) {
+async function runWxrImport(page, filename, { rewriteUrls = true, streamEntities = false } = {}) {
 	// Extra time for CI/Playground
 	test.setTimeout(240000);
 
@@ -487,6 +566,15 @@ async function runWxrImport(page, filename, { rewriteUrls = true } = {}) {
 		await page.check('#rewrite-urls');
 	} else {
 		await page.uncheck('#rewrite-urls');
+	}
+
+	if (streamEntities) {
+		await page.check('#stream-entities');
+	} else {
+		const streamCheckbox = page.locator('#stream-entities');
+		if ((await streamCheckbox.isVisible()) && (await streamCheckbox.isChecked())) {
+			await streamCheckbox.uncheck();
+		}
 	}
 
 	// Proceed to step=2 (author mapping defaults to current user)
@@ -543,6 +631,25 @@ async function getPostsEdit(page, searchTerm = '', perPage = 10) {
 	const posts = await res.json();
 	expect(Array.isArray(posts)).toBeTruthy();
 	return posts;
+}
+
+// Helper: Get pages via REST API with context=edit
+async function getPagesEdit(page, searchTerm = '', perPage = 10) {
+	await page.goto(abs('/wp-admin/'));
+	await loginIfNeeded(page);
+
+	const nonce = await page.evaluate(() => window.wpApiSettings?.nonce ?? '');
+	const searchParam = searchTerm ? `&search=${encodeURIComponent(searchTerm)}` : '';
+	const url = abs(`/wp-json/wp/v2/pages?_embed=1${searchParam}&per_page=${perPage}&context=edit`);
+	const headers = nonce ? { 'X-WP-Nonce': nonce } : {};
+	const res = await page.request.get(url, { headers });
+	if (!res.ok()) {
+		const bodyText = await res.text();
+		throw new Error(`Failed to fetch pages with context=edit: ${res.status()} ${bodyText}`);
+	}
+	const pages = await res.json();
+	expect(Array.isArray(pages)).toBeTruthy();
+	return pages;
 }
 
 // Helper: Find post by title
