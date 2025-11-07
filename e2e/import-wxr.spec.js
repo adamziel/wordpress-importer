@@ -17,37 +17,31 @@ const PARSERS = process.env.PARSER
 	? [process.env.PARSER]
 	: ['simplexml', 'xml', 'regex', 'xmlprocessor'];
 let PLAYGROUND_URL = '';
-// Run tests for each parser
-PARSERS.forEach((parser) => {
-	test.describe(`WXR Import with ${parser} parser`, () => {
-		test(`imports a simple WXR file using ${parser} parser`, async ({ page, request }) => {
-			await withPlaygroundServer(
-				async () => {
-					// Run the import
-					await runWxrImport(page, 'wxr-simple.xml');
 
-					// Get posts (edit context to access raw block markup) and find the imported one
-					const posts = await getPostsEdit(page, 'Road Not Taken');
-					expect(posts.length).toBeGreaterThan(0);
-					const post = findPostByTitle(posts, 'The Road Not Taken');
+const FIXTURES = [
+	{
+		name: 'simple',
+		file: 'wxr-simple.xml',
+		validate: async ({ page }) => {
+			const posts = await getPostsEdit(page, 'Road Not Taken');
+			expect(posts.length).toBeGreaterThan(0);
+			const post = findPostByTitle(posts, 'The Road Not Taken');
 
-					// Verify post data
-					const normalized = normalizePostData(post);
-					expect(normalized).toMatchObject({
-						status: 'publish',
-						type: 'post',
-						sticky: false,
-						title: expect.stringContaining('The Road Not Taken'),
-						slug: expect.stringMatching(/^hello-world/),
-						datePrefix: '2024-06-05',
-						authorSlug: 'admin',
-						categories: expect.arrayContaining(['uncategorized']),
-						comment_status: expect.stringMatching(/^(open|closed)$/),
-						ping_status: expect.stringMatching(/^(open|closed)$/),
-					});
+			const normalized = normalizePostData(post);
+			expect(normalized).toMatchObject({
+				status: 'publish',
+				type: 'post',
+				sticky: false,
+				title: expect.stringContaining('The Road Not Taken'),
+				slug: expect.stringMatching(/^hello-world/),
+				datePrefix: '2024-06-05',
+				authorSlug: 'admin',
+				categories: expect.arrayContaining(['uncategorized']),
+				comment_status: expect.stringMatching(/^(open|closed)$/),
+				ping_status: expect.stringMatching(/^(open|closed)$/),
+			});
 
-					// Compare raw block markup with tolerant normalization (<br> vs <br />, minor whitespace)
-					const simpleExpected = `<!-- wp:paragraph -->
+			const simpleExpected = `<!-- wp:paragraph -->
 <p>Two roads diverged in a yellow wood,<br>And sorry I could not travel both</p>
 <!-- /wp:paragraph -->
 
@@ -63,53 +57,39 @@ ${PLAYGROUND_URL.slice('http://'.length)}/one was the best choice.
 https://playground.internal/path-not-taken was the second best choice.
 </p>
 <!-- /wp:paragraph -->`;
-					expect(normalizeBlockMarkup(normalized.rawContent)).toContain(
-						normalizeBlockMarkup(simpleExpected)
-					);
-
-					// Verify frontend rendering
-					await goToPostFrontend(page, post);
-					await expect(
-						page.getByText('Two roads diverged in a yellow wood')
-					).toBeVisible();
-					await expect(page.getByRole('link', { name: 'One' })).toBeVisible();
-					await expect(page.locator('a[href="https://w.org"]')).toBeVisible();
-				},
-				{ parser }
+			expect(normalizeBlockMarkup(normalized.rawContent)).toContain(
+				normalizeBlockMarkup(simpleExpected)
 			);
-		});
 
-		test(`imports a base URL rewriting WXR file using ${parser} parser`, async ({
-			page,
-			request,
-		}) => {
-			await withPlaygroundServer(
-				async () => {
-					// Run the import
-					await runWxrImport(page, 'wxr-base-url-rewriting.xml');
+			await goToPostFrontend(page, post);
+			await expect(page.getByText('Two roads diverged in a yellow wood')).toBeVisible();
+			await expect(page.getByRole('link', { name: 'One' })).toBeVisible();
+			await expect(page.locator('a[href="https://w.org"]')).toBeVisible();
+		},
+	},
+	{
+		name: 'base-url-rewriting',
+		file: 'wxr-base-url-rewriting.xml',
+		validate: async ({ page }) => {
+			const posts = await getPostsEdit(page, 'Road Not Taken');
+			expect(posts.length).toBeGreaterThan(0);
+			const post = findPostByTitle(posts, 'The Road Not Taken');
 
-					// Get posts and find the imported one
-					const posts = await getPostsEdit(page, 'Road Not Taken');
-					expect(posts.length).toBeGreaterThan(0);
-					const post = findPostByTitle(posts, 'The Road Not Taken');
+			const normalized = normalizePostData(post);
+			expect(normalized).toMatchObject({
+				status: 'publish',
+				type: 'post',
+				sticky: false,
+				title: expect.stringContaining('The Road Not Taken'),
+				slug: expect.stringMatching(/^hello-world/),
+				datePrefix: '2024-06-05',
+				authorSlug: 'admin',
+				categories: expect.arrayContaining(['uncategorized']),
+				comment_status: expect.stringMatching(/^(open|closed)$/),
+				ping_status: expect.stringMatching(/^(open|closed)$/),
+			});
 
-					// Verify post data
-					const normalized = normalizePostData(post);
-					expect(normalized).toMatchObject({
-						status: 'publish',
-						type: 'post',
-						sticky: false,
-						title: expect.stringContaining('The Road Not Taken'),
-						slug: expect.stringMatching(/^hello-world/),
-						datePrefix: '2024-06-05',
-						authorSlug: 'admin',
-						categories: expect.arrayContaining(['uncategorized']),
-						comment_status: expect.stringMatching(/^(open|closed)$/),
-						ping_status: expect.stringMatching(/^(open|closed)$/),
-					});
-
-					// Compare raw block markup with tolerant normalization (<br> vs <br />, minor whitespace)
-					const baseUrlExpected = `<!-- wp:paragraph -->
+			const baseUrlExpected = `<!-- wp:paragraph -->
 <p>
     <!-- Rewrites URLs that match the base URL -->
     URLs to rewrite:
@@ -118,7 +98,7 @@ https://playground.internal/path-not-taken was the second best choice.
     ${PLAYGROUND_URL}
     ${PLAYGROUND_URL}
     ${PLAYGROUND_URL}/
-    <a href=\"${PLAYGROUND_URL}/wp-content/image.png\">Test</a>
+    <a href="${PLAYGROUND_URL}/wp-content/image.png">Test</a>
 
     <!-- Correctly ignores URLs that are similar to the base URL but do not match it -->
     This isn't migrated: https://🚀-science.comcast/science <br>
@@ -129,16 +109,163 @@ https://playground.internal/path-not-taken was the second best choice.
 <!-- wp:image {"alt":"${PLAYGROUND_URL}/wp-content/image.png","notUrl":"/science/wp-content/image.png","url":"/wp-content/image.png"} -->
 <img src="${PLAYGROUND_URL}/wp-content/image.png">
 <!-- /wp:image -->`;
-					expect(normalizeBlockMarkup(normalized.rawContent)).toContain(
-						normalizeBlockMarkup(baseUrlExpected)
-					);
 
-					// Verify frontend rendering
-					await goToPostFrontend(page, post);
-					await expect(page.getByText('URLs to rewrite')).toBeVisible();
-				},
-				{ parser }
+			expect(normalizeBlockMarkup(normalized.rawContent)).toContain(
+				normalizeBlockMarkup(baseUrlExpected)
 			);
+
+			await goToPostFrontend(page, post);
+			await expect(page.getByText('URLs to rewrite')).toBeVisible();
+		},
+	},
+	{
+		name: 'css-urls',
+		file: 'wxr-css-urls.xml',
+		validate: async ({ page }) => {
+			const posts = await getPostsEdit(page, 'CSS URL Migration');
+			expect(posts.length).toBeGreaterThan(0);
+			const post = findPostByTitle(posts, 'CSS URL Migration Test');
+
+			const normalized = normalizePostData(post);
+			expect(normalized).toMatchObject({
+				status: 'publish',
+				type: 'post',
+				title: expect.stringContaining('CSS URL Migration Test'),
+			});
+
+			const normalizedContent = normalizeBlockMarkup(normalized.rawContent);
+			const cssExpectations = [
+				{
+					description: 'single quoted absolute URL is rewritten',
+					snippet: `<p style="background-image: url(&quot;${PLAYGROUND_URL}/wp-content/uploads/bg1.jpg&quot;)">Quoted URL with single quotes</p>`,
+				},
+				{
+					description: 'double quoted absolute URL is rewritten',
+					snippet: `<p style="background-image: url(&quot;${PLAYGROUND_URL}/wp-content/uploads/bg2.jpg&quot;)">Quoted URL with double quotes</p>`,
+				},
+				{
+					description: 'unquoted absolute URL gains quotes after rewrite',
+					snippet: `<p style="background-image: url(&quot;${PLAYGROUND_URL}/wp-content/uploads/bg3.jpg&quot;)">Unquoted URL</p>`,
+				},
+				{
+					description: 'relative URL remains relative',
+					snippet: `<p style="background: url(&quot;/wp-content/uploads/bg4.jpg&quot;) no-repeat">Relative URL with single quotes</p>`,
+				},
+				{
+					description: 'relative URL inside comment remains relative',
+					snippet: `<p style="background: /* comment */ url(&quot;/wp-content/uploads/bg5.jpg&quot;) no-repeat">URL after CSS comment</p>`,
+				},
+				{
+					description: 'trailing comment survives rewrite',
+					snippet: `<p style="background-image: url(&quot;${PLAYGROUND_URL}/wp-content/uploads/bg6.jpg&quot;); /* trailing comment */ ">URL with trailing comment</p>`,
+				},
+				{
+					description: 'strings containing url() are left intact beyond URL rewrite',
+					snippet: `<p style="content: &quot;This is a url(fake) in a string&quot;; background: url(&quot;${PLAYGROUND_URL}/wp-content/uploads/bg7.jpg&quot;)">URL with string containing fake url()</p>`,
+				},
+				{
+					description: 'escaped parentheses survive rewrite',
+					snippet: `<p style="background-image: url(&quot;${PLAYGROUND_URL}/wp-content/uploads/bg(special).jpg&quot;)">URL with escaped parentheses</p>`,
+				},
+				{
+					description: 'data URIs are untouched',
+					snippet: `<p style="background: url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==)">Data URI (should not be migrated)</p>`,
+				},
+				{
+					description: 'multiple URLs within one declaration are rewritten',
+					snippet: `<p style="background: url(&quot;${PLAYGROUND_URL}/wp-content/uploads/bg8.jpg&quot;), url(&quot;${PLAYGROUND_URL}/wp-content/uploads/bg9.jpg&quot;)">Multiple URLs</p>`,
+				},
+				{
+					description: 'uppercase URL keyword still works',
+					snippet: `<p style="background-image: URL(&quot;${PLAYGROUND_URL}/wp-content/uploads/BG10.JPG&quot;)">Uppercase URL keyword</p>`,
+				},
+				{
+					description: 'figure background styles are rewritten',
+					snippet: `<figure class="wp-block-image" style="background: url(&quot;${PLAYGROUND_URL}/wp-content/uploads/figure-bg.jpg&quot;)"><img src="${PLAYGROUND_URL}/wp-content/uploads/image.jpg" alt="Test Image" /></figure>`,
+				},
+				{
+					description: 'HTML block inline styles are rewritten',
+					snippet: `<!-- wp:html -->\n<div style="background-image: url(&quot;${PLAYGROUND_URL}/wp-content/uploads/html-bg.jpg&quot;)">\n\tHTML block with inline style\n</div>`,
+				},
+				{
+					description: 'explicit background-image: none stays untouched',
+					snippet: `<!-- wp:html -->\n<div style="background-image: none">\n\tHTML block with background-image: none\n</div>`,
+				},
+			];
+
+			cssExpectations.forEach(({ description, snippet }) => {
+				expect(normalizedContent).toContain(normalizeBlockMarkup(snippet));
+			});
+		},
+	},
+	{
+		name: 'comprehensive',
+		file: 'wxr-comprehensive.xml',
+		validate: async ({ page }) => {
+			const posts = await getPostsEdit(page, 'Comprehensive Post');
+			expect(posts.length).toBeGreaterThan(0);
+			const comprehensivePost = findPostByTitle(posts, 'Comprehensive Post');
+
+			const postTerms = (comprehensivePost?._embedded?.['wp:term'] || [])
+				.flat()
+				.filter(Boolean);
+			const tagSlugs = postTerms
+				.filter((term) => term.taxonomy === 'post_tag')
+				.map((term) => (term.slug || term.name || '').toString().toLowerCase());
+
+			const normalizedPost = normalizePostData(comprehensivePost);
+			expect(normalizedPost).toMatchObject({
+				status: 'publish',
+				type: 'post',
+				title: expect.stringContaining('Comprehensive Post'),
+				categories: expect.arrayContaining(['news', 'updates']),
+				comment_status: 'open',
+			});
+			expect(tagSlugs).toEqual(expect.arrayContaining(['t1', 't2']));
+
+			const commentsResponse = await page.request.get(
+				abs(`/wp-json/wp/v2/comments?post=${comprehensivePost.id}`)
+			);
+			expect(commentsResponse.ok()).toBeTruthy();
+			const comments = await commentsResponse.json();
+			expect(comments).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({
+						content: expect.objectContaining({
+							rendered: expect.stringContaining('Great post!'),
+						}),
+					}),
+				])
+			);
+
+			const pages = await getPagesEdit(page, 'Comprehensive Page');
+			expect(pages.length).toBeGreaterThan(0);
+			const comprehensivePage = findPostByTitle(pages, 'Comprehensive Page');
+			const normalizedPage = normalizePostData(comprehensivePage);
+			expect(normalizedPage).toMatchObject({
+				type: 'page',
+				comment_status: 'closed',
+				title: expect.stringContaining('Comprehensive Page'),
+			});
+		},
+	},
+];
+// Run tests for each parser
+PARSERS.forEach((parser) => {
+	test.describe(`WXR Import with ${parser} parser`, () => {
+		FIXTURES.forEach((fixture) => {
+			test(`imports ${fixture.name} fixture using ${parser} parser`, async ({
+				page,
+				request,
+			}) => {
+				await withPlaygroundServer(
+					async () => {
+						await runWxrImport(page, fixture.file);
+						await fixture.validate({ page, request });
+					},
+					{ parser }
+				);
+			});
 		});
 
 		test(`imports a large 10MB WXR file successfully`, async ({ page }) => {
@@ -167,101 +294,6 @@ https://playground.internal/path-not-taken was the second best choice.
 				).toBeVisible();
 				await expect(page.locator('a[href$="/wp-admin/"]')).toBeVisible();
 			});
-		});
-
-		test(`imports CSS URLs in style attributes using ${parser} parser`, async ({
-			page,
-			request,
-		}) => {
-			await withPlaygroundServer(
-				async () => {
-					// Run the import
-					await runWxrImport(page, 'wxr-css-urls.xml');
-
-					// Get posts and find the imported one
-					const posts = await getPostsEdit(page, 'CSS URL Migration');
-					expect(posts.length).toBeGreaterThan(0);
-					const post = findPostByTitle(posts, 'CSS URL Migration Test');
-
-					// Verify post data
-					const normalized = normalizePostData(post);
-					expect(normalized).toMatchObject({
-						status: 'publish',
-						type: 'post',
-						title: expect.stringContaining('CSS URL Migration Test'),
-					});
-
-					// Test various CSS URL scenarios
-					expect(normalized.rawContent).toEqual(`<!-- wp:paragraph -->
-<p>Testing CSS URL migration in style attributes:</p>
-<!-- /wp:paragraph -->
-
-<!-- wp:paragraph -->
-<p style="background-image: url(&quot;${PLAYGROUND_URL}/wp-content/uploads/bg1.jpg&quot;)">Quoted URL with single quotes</p>
-<!-- /wp:paragraph -->
-
-<!-- wp:paragraph -->
-<p style="background-image: url(&quot;${PLAYGROUND_URL}/wp-content/uploads/bg2.jpg&quot;)">Quoted URL with double quotes</p>
-<!-- /wp:paragraph -->
-
-<!-- wp:paragraph -->
-<p style="background-image: url(&quot;${PLAYGROUND_URL}/wp-content/uploads/bg3.jpg&quot;)">Unquoted URL</p>
-<!-- /wp:paragraph -->
-
-<!-- wp:paragraph -->
-<p style="background: url(&quot;/wp-content/uploads/bg4.jpg&quot;) no-repeat">Relative URL with single quotes</p>
-<!-- /wp:paragraph -->
-
-<!-- wp:paragraph -->
-<p style="background: /* comment */ url(&quot;/wp-content/uploads/bg5.jpg&quot;) no-repeat">URL after CSS comment</p>
-<!-- /wp:paragraph -->
-
-<!-- wp:paragraph -->
-<p style="background-image: url(&quot;${PLAYGROUND_URL}/wp-content/uploads/bg6.jpg&quot;); /* trailing comment */ ">URL with trailing comment</p>
-<!-- /wp:paragraph -->
-
-<!-- wp:paragraph -->
-<p style="content: &quot;This is a url(fake) in a string&quot;; background: url(&quot;${PLAYGROUND_URL}/wp-content/uploads/bg7.jpg&quot;)">URL with string containing fake url()</p>
-<!-- /wp:paragraph -->
-
-<!-- wp:paragraph -->
-<p style="background-image: url(&quot;${PLAYGROUND_URL}/wp-content/uploads/bg(special).jpg&quot;)">URL with escaped parentheses</p>
-<!-- /wp:paragraph -->
-
-<!-- wp:paragraph -->
-<p style="background: url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==)">Data URI (should not be migrated)</p>
-<!-- /wp:paragraph -->
-
-<!-- wp:paragraph -->
-<p style="background: url(&quot;${PLAYGROUND_URL}/wp-content/uploads/bg8.jpg&quot;), url(&quot;${PLAYGROUND_URL}/wp-content/uploads/bg9.jpg&quot;)">Multiple URLs</p>
-<!-- /wp:paragraph -->
-
-<!-- wp:paragraph -->
-<p style="background-image: URL(&quot;${PLAYGROUND_URL}/wp-content/uploads/BG10.JPG&quot;)">Uppercase URL keyword</p>
-<!-- /wp:paragraph -->
-
-<!-- wp:image -->
-<figure class="wp-block-image" style="background: url(&quot;${PLAYGROUND_URL}/wp-content/uploads/figure-bg.jpg&quot;)"><img src="${PLAYGROUND_URL}/wp-content/uploads/image.jpg" alt="Test Image" /></figure>
-<!-- /wp:image -->
-
-<!-- wp:html -->
-<div style="background-image: url(&quot;${PLAYGROUND_URL}/wp-content/uploads/html-bg.jpg&quot;)">
-	HTML block with inline style
-</div>
-<!-- /wp:html -->
-
-<!-- wp:html -->
-<div style="background-image: none">
-	HTML block with background-image: none
-</div>
-<!-- /wp:html -->`);
-
-					// Verify frontend rendering
-					await goToPostFrontend(page, post);
-					await expect(page.getByText('Testing CSS URL migration')).toBeVisible();
-				},
-				{ parser }
-			);
 		});
 
 		test.describe('Comprehensive WXR import', () => {
@@ -454,79 +486,21 @@ async function startPlayground(parser = null) {
 }
 
 test.describe('Streaming Entity Loop', () => {
-	test('imports a simple WXR file using the streaming loop', async ({ page }) => {
-		await withPlaygroundServer(async () => {
-			await runWxrImport(page, 'wxr-simple.xml', { streamEntities: true });
-
-			const posts = await getPostsEdit(page, 'Road Not Taken');
-			expect(posts.length).toBeGreaterThan(0);
-			const post = findPostByTitle(posts, 'The Road Not Taken');
-			expect(post).toBeTruthy();
-
-			const normalized = normalizePostData(post);
-			expect(normalized).toMatchObject({
-				status: 'publish',
-				type: 'post',
-				sticky: false,
-				title: expect.stringContaining('The Road Not Taken'),
-				categories: expect.arrayContaining(['uncategorized']),
-			});
-
-			await goToPostFrontend(page, post);
-			await expect(page.getByText('Two roads diverged in a yellow wood')).toBeVisible();
-		});
-	});
-
-	test.only('imports the comprehensive WXR fixture using the streaming loop', async ({
-		page,
-	}) => {
-		await withPlaygroundServer(async () => {
-			await runWxrImport(page, 'wxr-comprehensive.xml', { streamEntities: true });
-
-			const posts = await getPostsEdit(page, 'Comprehensive Post');
-			expect(posts.length).toBeGreaterThan(0);
-			const comprehensivePost = findPostByTitle(posts, 'Comprehensive Post');
-
-			const postTerms = (comprehensivePost?._embedded?.['wp:term'] || [])
-				.flat()
-				.filter(Boolean);
-			const tagSlugs = postTerms
-				.filter((term) => term.taxonomy === 'post_tag')
-				.map((term) => (term.slug || term.name || '').toString().toLowerCase());
-
-			const normalizedPost = normalizePostData(comprehensivePost);
-			expect(normalizedPost).toMatchObject({
-				status: 'publish',
-				type: 'post',
-				title: expect.stringContaining('Comprehensive Post'),
-				categories: expect.arrayContaining(['news', 'updates']),
-				comment_status: 'open',
-			});
-			expect(tagSlugs).toEqual(expect.arrayContaining(['t1', 't2']));
-
-			const commentsResponse = await page.request.get(
-				abs(`/wp-json/wp/v2/comments?post=${comprehensivePost.id}`)
-			);
-			expect(commentsResponse.ok()).toBeTruthy();
-			const comments = await commentsResponse.json();
-			expect(comments).toEqual(
-				expect.arrayContaining([
-					expect.objectContaining({
-						content: expect.objectContaining({
-							rendered: expect.stringContaining('Great post!'),
-						}),
-					}),
-				])
-			);
-
-			const pages = await getPagesEdit(page, 'Comprehensive Page');
-			expect(pages.length).toBeGreaterThan(0);
-			const comprehensivePage = findPostByTitle(pages, 'Comprehensive Page');
-			const normalizedPage = normalizePostData(comprehensivePage);
-			expect(normalizedPage).toMatchObject({
-				type: 'page',
-				comment_status: 'closed',
-				title: expect.stringContaining('Comprehensive Page'),
+	PARSERS.forEach((parser) => {
+		test.describe(`with ${parser} parser`, () => {
+			FIXTURES.forEach((fixture) => {
+				test(`imports ${fixture.name} fixture using streaming loop`, async ({
+					page,
+					request,
+				}) => {
+					await withPlaygroundServer(
+						async () => {
+							await runWxrImport(page, fixture.file, { streamEntities: true });
+							await fixture.validate({ page, request });
+						},
+						{ parser }
+					);
+				});
 			});
 		});
 	});
