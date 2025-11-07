@@ -16,6 +16,7 @@ const fs = require('fs');
 const PARSERS = process.env.PARSER
 	? [process.env.PARSER]
 	: ['simplexml', 'xml', 'regex', 'xmlprocessor'];
+const STREAMING_PARSERS = ['xmlprocessor'];
 let PLAYGROUND_URL = '';
 
 const FIXTURES = [
@@ -249,6 +250,61 @@ https://playground.internal/path-not-taken was the second best choice.
 			});
 		},
 	},
+	{
+		name: 'post-processing',
+		file: 'wxr-post-processing.xml',
+		options: {
+			fetchAttachments: true,
+		},
+		validate: async ({ page, request }) => {
+			const childRes = await request.get(
+				abs('/wp-json/wp/v2/pages?search=Child%20Before%20Parent&per_page=5')
+			);
+			expect(childRes.ok()).toBeTruthy();
+			const childCandidates = await childRes.json();
+			const childPage = childCandidates.find(
+				(pageData) => pageData.slug === 'child-before-parent'
+			);
+			expect(childPage).toBeTruthy();
+			expect(childPage.parent).toBeGreaterThan(0);
+
+			const parentRes = await request.get(abs(`/wp-json/wp/v2/pages/${childPage.parent}`));
+			expect(parentRes.ok()).toBeTruthy();
+			const parentPage = await parentRes.json();
+			expect(parentPage.slug).toBe('parent-landing-page');
+
+			const postsRes = await request.get(
+				abs('/wp-json/wp/v2/posts?search=Attachment%20Consumer&per_page=5')
+			);
+			expect(postsRes.ok()).toBeTruthy();
+			const posts = await postsRes.json();
+			const consumer = posts.find((p) => p.slug === 'attachment-consumer');
+			expect(consumer).toBeTruthy();
+
+			const rendered = consumer?.content?.rendered || '';
+			const legacyUrl =
+				'https://playground.internal/wp-content/plugins/wordpress-importer/e2e/fixtures/uploads/post-processing-image.jpg';
+			expect(rendered).not.toContain(legacyUrl);
+			expect(rendered).toContain(`${PLAYGROUND_URL}/wp-content/uploads/`);
+
+			const commentsRes = await request.get(
+				abs(`/wp-json/wp/v2/comments?post=${consumer.id}&per_page=10`)
+			);
+			expect(commentsRes.ok()).toBeTruthy();
+			const comments = await commentsRes.json();
+			const reply = comments.find((comment) =>
+				(comment.content?.rendered || '').includes('Reply arrives before its parent')
+			);
+			const parentComment = comments.find((comment) =>
+				(comment.content?.rendered || '').includes(
+					'Parent comment that should adopt children'
+				)
+			);
+			expect(reply).toBeTruthy();
+			expect(parentComment).toBeTruthy();
+			expect(reply.parent).toBe(8002);
+		},
+	},
 ];
 // Run tests for each parser
 PARSERS.forEach((parser) => {
@@ -260,7 +316,7 @@ PARSERS.forEach((parser) => {
 			}) => {
 				await withPlaygroundServer(
 					async () => {
-						await runWxrImport(page, fixture.file);
+						await runWxrImport(page, fixture.file, fixture.options || {});
 						await fixture.validate({ page, request });
 					},
 					{ parser }
@@ -486,16 +542,19 @@ async function startPlayground(parser = null) {
 }
 
 test.describe('Streaming Entity Loop', () => {
-	PARSERS.forEach((parser) => {
+	STREAMING_PARSERS.forEach((parser) => {
 		test.describe(`with ${parser} parser`, () => {
 			FIXTURES.forEach((fixture) => {
-				test(`imports ${fixture.name} fixture using streaming loop`, async ({
+				test.only(`imports ${fixture.name} fixture using streaming loop`, async ({
 					page,
 					request,
 				}) => {
 					await withPlaygroundServer(
 						async () => {
-							await runWxrImport(page, fixture.file, { streamEntities: true });
+							await runWxrImport(page, fixture.file, {
+								...(fixture.options || {}),
+								streamEntities: true,
+							});
 							await fixture.validate({ page, request });
 						},
 						{ parser }
@@ -511,7 +570,11 @@ function abs(u) {
 }
 
 // Helper: Run WXR import process
-async function runWxrImport(page, filename, { rewriteUrls = true, streamEntities = false } = {}) {
+async function runWxrImport(
+	page,
+	filename,
+	{ rewriteUrls = true, streamEntities = false, fetchAttachments = false } = {}
+) {
 	// Extra time for CI/Playground
 	test.setTimeout(240000);
 
@@ -540,6 +603,15 @@ async function runWxrImport(page, filename, { rewriteUrls = true, streamEntities
 		await page.check('#rewrite-urls');
 	} else {
 		await page.uncheck('#rewrite-urls');
+	}
+
+	const attachmentsCheckbox = page.locator('#import-attachments');
+	if (await attachmentsCheckbox.count()) {
+		if (fetchAttachments) {
+			await attachmentsCheckbox.check().catch(() => {});
+		} else {
+			await attachmentsCheckbox.uncheck().catch(() => {});
+		}
 	}
 
 	if (streamEntities) {

@@ -546,18 +546,10 @@ class WP_Import extends WP_Importer {
 						$comment['user_id'] = $this->processed_authors[ $data['comment_user_id'] ];
 					}
 
-					if ( $comment_parent && ! isset( $this->stream_post_context['comment_id_map'][ $comment_parent ] ) ) {
-						$this->stream_post_context['pending_comments'][] = array(
-							'original_id' => $original_comment_id,
-							'comment'     => $comment,
-						);
-						break;
-					}
-
 					if ( $comment_parent && isset( $this->stream_post_context['comment_id_map'][ $comment_parent ] ) ) {
 						$comment['comment_parent'] = $this->stream_post_context['comment_id_map'][ $comment_parent ];
 					} else {
-						$comment['comment_parent'] = 0;
+						$comment['comment_parent'] = (int) $comment_parent;
 					}
 
 					$inserted_comment_id = $this->process_post_comment(
@@ -573,7 +565,6 @@ class WP_Import extends WP_Importer {
 						}
 
 						$this->apply_pending_comment_meta_for( $original_comment_id, $inserted_comment_id );
-						$this->drain_pending_comments();
 					}
 					break;
 
@@ -835,7 +826,6 @@ class WP_Import extends WP_Importer {
 			return;
 		}
 
-		$this->drain_pending_comments();
 		$this->stream_post_context = $this->empty_stream_post_context();
 		$this->stream_cursor['current_post_id']         = null;
 		$this->stream_cursor['current_comment_post_id'] = null;
@@ -886,59 +876,6 @@ class WP_Import extends WP_Importer {
 		);
 
 		unset( $this->stream_post_context['pending_comment_meta'][ $original_comment_id ] );
-	}
-
-	/**
-	 * Attempts to insert any pending comments once their parents exist.
-	 */
-	private function drain_pending_comments() {
-		if ( empty( $this->stream_post_context['pending_comments'] ) ) {
-			return;
-		}
-
-		$made_progress = true;
-
-		while ( $made_progress && ! empty( $this->stream_post_context['pending_comments'] ) ) {
-			$made_progress = false;
-
-			foreach ( $this->stream_post_context['pending_comments'] as $index => $pending ) {
-				$pending_parent = isset( $pending['comment']['comment_parent'] ) ? (int) $pending['comment']['comment_parent'] : 0;
-
-				if ( $pending_parent && ! isset( $this->stream_post_context['comment_id_map'][ $pending_parent ] ) ) {
-					continue;
-				}
-
-				if ( $pending_parent && isset( $this->stream_post_context['comment_id_map'][ $pending_parent ] ) ) {
-					$pending['comment']['comment_parent'] = $this->stream_post_context['comment_id_map'][ $pending_parent ];
-				} else {
-					$pending['comment']['comment_parent'] = 0;
-				}
-
-				$inserted_comment_id = $this->process_post_comment(
-					$pending['comment'],
-					(bool) $this->stream_post_context['post_exists'],
-					$this->stream_post_context['comment_post_id']
-				);
-
-				if ( ! $inserted_comment_id ) {
-					continue;
-				}
-
-				$this->stream_cursor['last_comment_id'] = $inserted_comment_id;
-
-				if ( null !== $pending['original_id'] ) {
-					$this->stream_post_context['comment_id_map'][ $pending['original_id'] ] = $inserted_comment_id;
-				}
-
-				$this->apply_pending_comment_meta_for( $pending['original_id'], $inserted_comment_id );
-				unset( $this->stream_post_context['pending_comments'][ $index ] );
-				$made_progress = true;
-			}
-		}
-
-		if ( ! empty( $this->stream_post_context['pending_comments'] ) ) {
-			$this->stream_post_context['pending_comments'] = array();
-		}
 	}
 
 	/**
