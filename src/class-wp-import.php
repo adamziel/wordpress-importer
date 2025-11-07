@@ -517,7 +517,7 @@ class WP_Import extends WP_Importer {
 						'value' => isset( $data['value'] ) ? $data['value'] : ( isset( $data['meta_value'] ) ? $data['meta_value'] : '' ),
 					);
 
-					$this->process_post_meta( $meta, $this->stream_post_context['post_id'], $this->stream_post_context['post'] );
+					$this->process_post_meta( $meta, $this->stream_post_context['post_id'] );
 					break;
 
 				case 'comment':
@@ -572,13 +572,6 @@ class WP_Import extends WP_Importer {
 							$this->stream_post_context['comment_id_map'][ $original_comment_id ] = $inserted_comment_id;
 						}
 
-						do_action(
-							'wp_import_insert_comment',
-							$inserted_comment_id,
-							$comment,
-							$this->stream_post_context['comment_post_id'],
-							$this->stream_post_context['post']
-						);
 						$this->apply_pending_comment_meta_for( $original_comment_id, $inserted_comment_id );
 						$this->drain_pending_comments();
 					}
@@ -936,14 +929,6 @@ class WP_Import extends WP_Importer {
 				if ( null !== $pending['original_id'] ) {
 					$this->stream_post_context['comment_id_map'][ $pending['original_id'] ] = $inserted_comment_id;
 				}
-
-				do_action(
-					'wp_import_insert_comment',
-					$inserted_comment_id,
-					$pending['comment'],
-					$this->stream_post_context['comment_post_id'],
-					$this->stream_post_context['post']
-				);
 
 				$this->apply_pending_comment_meta_for( $pending['original_id'], $inserted_comment_id );
 				unset( $this->stream_post_context['pending_comments'][ $index ] );
@@ -1814,7 +1799,8 @@ class WP_Import extends WP_Importer {
 		}
 
 		foreach ( $post_metas as $meta ) {
-			$this->process_post_meta( $meta, $post_id, $post );
+			$meta['key'] = apply_filters( 'import_post_meta_key', $meta['key'], $post_id, $post );
+			$this->process_post_meta( $meta, $post_id );
 		}
 	}
 
@@ -1825,8 +1811,8 @@ class WP_Import extends WP_Importer {
 	 * @param int   $post_id ID of the just imported post.
 	 * @param array $post    Raw post data from the WXR file.
 	 */
-	protected function process_post_meta( $meta, $post_id, $post ) {
-		$key   = apply_filters( 'import_post_meta_key', $meta['key'], $post_id, $post );
+	protected function process_post_meta( $meta, $post_id ) {
+		$key   = $meta['key'];
 		$value = false;
 
 		if ( '_edit_last' == $key ) {
