@@ -314,12 +314,12 @@ class WP_Import extends WP_Importer {
 						$this->processed_terms[ intval( $category['term_id'] ) ] = $processed_category['term_id'];
 					}
 
-						$this->stream_cursor['last_term_context'] = array(
-							'term'      => $category,
-							'processed' => $processed_category,
-							'termmeta'  => array(),
-						);
-						$this->stream_cursor['last_term_id']      = $processed_category['term_id'];
+					$this->stream_cursor['last_term_context'] = array(
+						'term'      => $category,
+						'processed' => $processed_category,
+						'termmeta'  => array(),
+					);
+					$this->stream_cursor['last_term_id']      = $processed_category['term_id'];
 					break;
 
 				case 'tag':
@@ -346,12 +346,12 @@ class WP_Import extends WP_Importer {
 						$this->processed_terms[ intval( $tag['term_id'] ) ] = $processed_tag['term_id'];
 					}
 
-						$this->stream_cursor['last_term_context'] = array(
-							'term'      => $tag,
-							'processed' => $processed_tag,
-							'termmeta'  => array(),
-						);
-						$this->stream_cursor['last_term_id']      = $processed_tag['term_id'];
+					$this->stream_cursor['last_term_context'] = array(
+						'term'      => $tag,
+						'processed' => $processed_tag,
+						'termmeta'  => array(),
+					);
+					$this->stream_cursor['last_term_id']      = $processed_tag['term_id'];
 					break;
 
 				case 'term':
@@ -377,12 +377,12 @@ class WP_Import extends WP_Importer {
 						$this->processed_terms[ intval( $term['term_id'] ) ] = $processed_term['term_id'];
 					}
 
-						$this->stream_cursor['last_term_context'] = array(
-							'term'      => $term,
-							'processed' => $processed_term,
-							'termmeta'  => array(),
-						);
-						$this->stream_cursor['last_term_id']      = $processed_term['term_id'];
+					$this->stream_cursor['last_term_context'] = array(
+						'term'      => $term,
+						'processed' => $processed_term,
+						'termmeta'  => array(),
+					);
+					$this->stream_cursor['last_term_id']      = $processed_term['term_id'];
 					break;
 
 				case 'term_meta':
