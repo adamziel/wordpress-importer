@@ -158,14 +158,7 @@ class WP_Import extends WP_Importer {
 
 		wp_suspend_cache_invalidation( true );
 		if ( $use_streaming_loop ) {
-			$streaming_success = $this->run_entity_loop();
-
-			if ( ! $streaming_success ) {
-				$this->process_categories();
-				$this->process_tags();
-				$this->process_terms();
-				$this->process_posts();
-			}
+			$this->run_entity_loop();
 		} else {
 			$this->process_categories();
 			$this->process_tags();
