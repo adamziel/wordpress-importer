@@ -545,7 +545,7 @@ test.describe('Streaming Entity Loop', () => {
 	STREAMING_PARSERS.forEach((parser) => {
 		test.describe(`with ${parser} parser`, () => {
 			FIXTURES.forEach((fixture) => {
-				test.only(`imports ${fixture.name} fixture using streaming loop`, async ({
+				test(`imports ${fixture.name} fixture using streaming loop`, async ({
 					page,
 					request,
 				}) => {

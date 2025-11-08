@@ -96,8 +96,8 @@ class WP_Import extends WP_Importer {
 				$this->import(
 					$file,
 					array(
-						'rewrite_urls'     => isset( $_POST['rewrite_urls'] ) && '1' === $_POST['rewrite_urls'],
-						'stream_entities'  => ! empty( $_POST['stream_entities'] ),
+						'rewrite_urls'    => isset( $_POST['rewrite_urls'] ) && '1' === $_POST['rewrite_urls'],
+						'stream_entities' => ! empty( $_POST['stream_entities'] ),
 					)
 				);
 				break;
@@ -218,19 +218,31 @@ class WP_Import extends WP_Importer {
 				'pending_comment_meta' => array(),
 			),
 			'last_term_context'       => array(),
+			'pending_entities'        => array(),
 		);
 
-		while ( $reader->next_entity() ) {
-			$entity = $reader->get_entity();
+		while ( true ) {
+			if ( ! empty( $this->stream_cursor['pending_entities'] ) ) {
+				$internal_entity = array_shift( $this->stream_cursor['pending_entities'] );
+				$entity_type     = $internal_entity['type'];
+				$data            = $internal_entity['data'];
+			} else {
+				if ( ! $reader->next_entity() ) {
+					break;
+				}
 
-			if ( ! $entity instanceof ImportEntity ) {
-				continue;
+				$entity = $reader->get_entity();
+
+				if ( ! $entity instanceof ImportEntity ) {
+					continue;
+				}
+
+				$data                                    = $entity->get_data();
+				$entity_type                             = $entity->get_type();
+				$this->stream_cursor['last_entity_type'] = $entity_type;
 			}
 
-			$data = $entity->get_data();
-			$this->stream_cursor['last_entity_type'] = $entity->get_type();
-
-			switch ( $entity->get_type() ) {
+			switch ( $entity_type ) {
 				case 'site_option':
 					if ( empty( $data['option_name'] ) ) {
 						break;
@@ -241,13 +253,13 @@ class WP_Import extends WP_Importer {
 							$this->version = $data['option_value'];
 							break;
 						case 'siteurl':
-							$this->base_url = esc_url( $data['option_value'] );
+							$this->base_url               = esc_url( $data['option_value'] );
 							$base_url_with_trailing_slash = rtrim( $this->base_url, '/' ) . '/';
 							$this->base_url_parsed        = WPURL::parse( $base_url_with_trailing_slash );
 							break;
 						case 'home':
 							if ( empty( $this->base_url ) ) {
-								$this->base_url = esc_url( $data['option_value'] );
+								$this->base_url               = esc_url( $data['option_value'] );
 								$base_url_with_trailing_slash = rtrim( $this->base_url, '/' ) . '/';
 								$this->base_url_parsed        = WPURL::parse( $base_url_with_trailing_slash );
 							}
@@ -268,12 +280,12 @@ class WP_Import extends WP_Importer {
 					$login = sanitize_user( $data['user_login'], true );
 
 					$this->authors[ $login ] = array(
-						'author_id'          => isset( $data['author_id'] ) ? $data['author_id'] : null,
-						'author_login'       => $login,
-						'author_email'       => isset( $data['author_email'] ) ? $data['author_email'] : '',
-						'author_display_name'=> isset( $data['author_display_name'] ) ? $data['author_display_name'] : $login,
-						'author_first_name'  => isset( $data['author_first_name'] ) ? $data['author_first_name'] : '',
-						'author_last_name'   => isset( $data['author_last_name'] ) ? $data['author_last_name'] : '',
+						'author_id'           => isset( $data['author_id'] ) ? $data['author_id'] : null,
+						'author_login'        => $login,
+						'author_email'        => isset( $data['author_email'] ) ? $data['author_email'] : '',
+						'author_display_name' => isset( $data['author_display_name'] ) ? $data['author_display_name'] : $login,
+						'author_first_name'   => isset( $data['author_first_name'] ) ? $data['author_first_name'] : '',
+						'author_last_name'    => isset( $data['author_last_name'] ) ? $data['author_last_name'] : '',
 					);
 					break;
 
@@ -293,10 +305,10 @@ class WP_Import extends WP_Importer {
 
 					$processed_category = $this->process_category( $category );
 
-						if ( false === $processed_category ) {
-							$this->stream_cursor['last_term_context'] = array();
-							break;
-						}
+					if ( false === $processed_category ) {
+						$this->stream_cursor['last_term_context'] = array();
+						break;
+					}
 
 					if ( isset( $category['term_id'] ) ) {
 						$this->processed_terms[ intval( $category['term_id'] ) ] = $processed_category['term_id'];
@@ -304,10 +316,10 @@ class WP_Import extends WP_Importer {
 
 						$this->stream_cursor['last_term_context'] = array(
 							'term'      => $category,
-						'processed' => $processed_category,
-						'termmeta'  => array(),
-					);
-					$this->stream_cursor['last_term_id'] = $processed_category['term_id'];
+							'processed' => $processed_category,
+							'termmeta'  => array(),
+						);
+						$this->stream_cursor['last_term_id']      = $processed_category['term_id'];
 					break;
 
 				case 'tag':
@@ -325,21 +337,21 @@ class WP_Import extends WP_Importer {
 
 					$processed_tag = $this->process_tag( $tag );
 
-						if ( false === $processed_tag ) {
-							$this->stream_cursor['last_term_context'] = array();
-							break;
-						}
+					if ( false === $processed_tag ) {
+						$this->stream_cursor['last_term_context'] = array();
+						break;
+					}
 
 					if ( isset( $tag['term_id'] ) ) {
 						$this->processed_terms[ intval( $tag['term_id'] ) ] = $processed_tag['term_id'];
 					}
 
 						$this->stream_cursor['last_term_context'] = array(
-						'term'      => $tag,
-						'processed' => $processed_tag,
-						'termmeta'  => array(),
-					);
-					$this->stream_cursor['last_term_id'] = $processed_tag['term_id'];
+							'term'      => $tag,
+							'processed' => $processed_tag,
+							'termmeta'  => array(),
+						);
+						$this->stream_cursor['last_term_id']      = $processed_tag['term_id'];
 					break;
 
 				case 'term':
@@ -356,21 +368,21 @@ class WP_Import extends WP_Importer {
 
 					$processed_term = $this->process_term( $term );
 
-						if ( false === $processed_term ) {
-							$this->stream_cursor['last_term_context'] = array();
-							break;
-						}
+					if ( false === $processed_term ) {
+						$this->stream_cursor['last_term_context'] = array();
+						break;
+					}
 
 					if ( isset( $term['term_id'] ) ) {
 						$this->processed_terms[ intval( $term['term_id'] ) ] = $processed_term['term_id'];
 					}
 
 						$this->stream_cursor['last_term_context'] = array(
-						'term'      => $term,
-						'processed' => $processed_term,
-						'termmeta'  => array(),
-					);
-					$this->stream_cursor['last_term_id'] = $processed_term['term_id'];
+							'term'      => $term,
+							'processed' => $processed_term,
+							'termmeta'  => array(),
+						);
+						$this->stream_cursor['last_term_id']      = $processed_term['term_id'];
 					break;
 
 				case 'term_meta':
@@ -383,7 +395,7 @@ class WP_Import extends WP_Importer {
 						break;
 					}
 
-						$this->stream_cursor['last_term_context']['termmeta'][] = array(
+					$this->stream_cursor['last_term_context']['termmeta'][] = array(
 						'key'   => $key,
 						'value' => isset( $data['value'] ) ? $data['value'] : ( isset( $data['meta_value'] ) ? $data['meta_value'] : '' ),
 					);
@@ -488,6 +500,7 @@ class WP_Import extends WP_Importer {
 					}
 
 					$this->stream_cursor['post_context'] = array(
+						'post'                 => $post,
 						'comment_id_map'       => array(),
 						'pending_comment_meta' => array(),
 					);
@@ -576,12 +589,15 @@ class WP_Import extends WP_Importer {
 					}
 
 					if ( isset( $this->stream_cursor['post_context']['comment_id_map'][ $original_comment_id ] ) ) {
-						$this->process_post_comment_meta(
-							$this->stream_cursor['post_context']['comment_id_map'][ $original_comment_id ],
-							array(
-								'key'   => $key,
-								'value' => isset( $data['value'] ) ? $data['value'] : ( isset( $data['meta_value'] ) ? $data['meta_value'] : '' ),
-							)
+						$this->stream_cursor['pending_entities'][] = array(
+							'type' => 'apply_comment_meta',
+							'data' => array(
+								'comment_id' => $this->stream_cursor['post_context']['comment_id_map'][ $original_comment_id ],
+								'meta'       => array(
+									'key'   => $key,
+									'value' => isset( $data['value'] ) ? $data['value'] : ( isset( $data['meta_value'] ) ? $data['meta_value'] : '' ),
+								),
+							),
 						);
 						break;
 					}
@@ -594,6 +610,14 @@ class WP_Import extends WP_Importer {
 						'key'   => $key,
 						'value' => isset( $data['value'] ) ? $data['value'] : ( isset( $data['meta_value'] ) ? $data['meta_value'] : '' ),
 					);
+					break;
+
+				case 'apply_comment_meta':
+					$applied_comment_id = isset( $data['comment_id'] ) ? (int) $data['comment_id'] : 0;
+					$meta               = isset( $data['meta'] ) && is_array( $data['meta'] ) ? $data['meta'] : null;
+					if ( $applied_comment_id && $meta && isset( $meta['key'] ) ) {
+						$this->process_post_comment_meta( $applied_comment_id, $meta );
+					}
 					break;
 
 				default:
@@ -633,11 +657,11 @@ class WP_Import extends WP_Importer {
 					'title'       => 'post_title',
 					'guid'        => 'guid',
 					'description' => 'post_excerpt',
-					'{http://purl.org/dc/elements/1.1/}creator'            => 'post_author',
-					'{http://purl.org/rss/1.0/modules/content/}encoded'    => 'post_content',
-					'{http://wordpress.org/export/1.0/excerpt/}encoded'    => 'post_excerpt',
-					'{http://wordpress.org/export/1.1/excerpt/}encoded'    => 'post_excerpt',
-					'{http://wordpress.org/export/1.2/excerpt/}encoded'    => 'post_excerpt',
+					'{http://purl.org/dc/elements/1.1/}creator' => 'post_author',
+					'{http://purl.org/rss/1.0/modules/content/}encoded' => 'post_content',
+					'{http://wordpress.org/export/1.0/excerpt/}encoded' => 'post_excerpt',
+					'{http://wordpress.org/export/1.1/excerpt/}encoded' => 'post_excerpt',
+					'{http://wordpress.org/export/1.2/excerpt/}encoded' => 'post_excerpt',
 				),
 			),
 		);
@@ -650,29 +674,29 @@ class WP_Import extends WP_Importer {
 				array(
 					'{' . $wxr_namespace . '}base_blog_url' => 'home',
 					'{' . $wxr_namespace . '}base_site_url' => 'siteurl',
-					'{' . $wxr_namespace . '}wxr_version'   => 'wxr_version',
-					'title'                                 => 'blogname',
+					'{' . $wxr_namespace . '}wxr_version' => 'wxr_version',
+					'title'                               => 'blogname',
 				)
 			);
 
 			$known_entities['item']['fields'] = array_merge(
 				$known_entities['item']['fields'],
 				array(
-					'{' . $wxr_namespace . '}post_id'            => 'post_id',
-					'{' . $wxr_namespace . '}status'             => 'status',
-					'{' . $wxr_namespace . '}post_date'          => 'post_date',
-					'{' . $wxr_namespace . '}post_date_gmt'      => 'post_date_gmt',
-					'{' . $wxr_namespace . '}post_modified'      => 'post_modified',
-					'{' . $wxr_namespace . '}post_modified_gmt'  => 'post_modified_gmt',
-					'{' . $wxr_namespace . '}comment_status'     => 'comment_status',
-					'{' . $wxr_namespace . '}ping_status'        => 'ping_status',
-					'{' . $wxr_namespace . '}post_name'          => 'post_name',
-					'{' . $wxr_namespace . '}post_parent'        => 'post_parent',
-					'{' . $wxr_namespace . '}menu_order'         => 'menu_order',
-					'{' . $wxr_namespace . '}post_type'          => 'post_type',
-					'{' . $wxr_namespace . '}post_password'      => 'post_password',
-					'{' . $wxr_namespace . '}is_sticky'          => 'is_sticky',
-					'{' . $wxr_namespace . '}attachment_url'     => 'attachment_url',
+					'{' . $wxr_namespace . '}post_id'     => 'post_id',
+					'{' . $wxr_namespace . '}status'      => 'status',
+					'{' . $wxr_namespace . '}post_date'   => 'post_date',
+					'{' . $wxr_namespace . '}post_date_gmt' => 'post_date_gmt',
+					'{' . $wxr_namespace . '}post_modified' => 'post_modified',
+					'{' . $wxr_namespace . '}post_modified_gmt' => 'post_modified_gmt',
+					'{' . $wxr_namespace . '}comment_status' => 'comment_status',
+					'{' . $wxr_namespace . '}ping_status' => 'ping_status',
+					'{' . $wxr_namespace . '}post_name'   => 'post_name',
+					'{' . $wxr_namespace . '}post_parent' => 'post_parent',
+					'{' . $wxr_namespace . '}menu_order'  => 'menu_order',
+					'{' . $wxr_namespace . '}post_type'   => 'post_type',
+					'{' . $wxr_namespace . '}post_password' => 'post_password',
+					'{' . $wxr_namespace . '}is_sticky'   => 'is_sticky',
+					'{' . $wxr_namespace . '}attachment_url' => 'attachment_url',
 				)
 			);
 
@@ -782,7 +806,7 @@ class WP_Import extends WP_Importer {
 	 * Flushes any remaining state attached to the current streamed post.
 	 */
 	protected function finalize_stream_post_context() {
-		$this->stream_cursor['post_context'] = array(
+		$this->stream_cursor['post_context']            = array(
 			'post'                 => null,
 			'comment_id_map'       => array(),
 			'pending_comment_meta' => array(),
@@ -808,9 +832,9 @@ class WP_Import extends WP_Importer {
 			return;
 		}
 
-		$term                              = $this->stream_cursor['last_term_context']['term'];
-		$term['termmeta']                  = $this->stream_cursor['last_term_context']['termmeta'];
-		$processed_term_id                 = $this->stream_cursor['last_term_context']['processed']['term_id'];
+		$term                                     = $this->stream_cursor['last_term_context']['term'];
+		$term['termmeta']                         = $this->stream_cursor['last_term_context']['termmeta'];
+		$processed_term_id                        = $this->stream_cursor['last_term_context']['processed']['term_id'];
 		$this->stream_cursor['last_term_context'] = array();
 
 		$this->process_termmeta( $term, $processed_term_id );
@@ -831,10 +855,15 @@ class WP_Import extends WP_Importer {
 			return;
 		}
 
-		$this->process_post_comment_metas(
-			$inserted_comment_id,
-			$this->stream_cursor['post_context']['pending_comment_meta'][ $original_comment_id ]
-		);
+		foreach ( $this->stream_cursor['post_context']['pending_comment_meta'][ $original_comment_id ] as $meta ) {
+			$this->stream_cursor['pending_entities'][] = array(
+				'type' => 'apply_comment_meta',
+				'data' => array(
+					'comment_id' => $inserted_comment_id,
+					'meta'       => $meta,
+				),
+			);
+		}
 
 		unset( $this->stream_cursor['post_context']['pending_comment_meta'][ $original_comment_id ] );
 	}
