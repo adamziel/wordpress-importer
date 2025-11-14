@@ -182,6 +182,23 @@ class WP_Import extends WP_Importer {
 	 * the execution flow explicit and resume-friendly. This bypasses the legacy
 	 * aggregate filters (`wp_import_tags`, `wp_import_posts`, etc.) because they
 	 * require loading the full dataset into memory.
+	 * 
+	 * TODO:
+	 * 
+	 * Stream handling for those properties:
+	 * 
+	 *	public $processed_authors    = array();
+	 *	public $author_mapping       = array();
+	 *	public $processed_terms      = array();
+	 *	public $processed_posts      = array();
+	 *	public $post_orphans         = array();
+	 *	public $processed_menu_items = array();
+	 *	public $menu_item_orphans    = array();
+	 *	public $missing_menu_items   = array();
+	 *
+	 *	public $fetch_attachments = false;
+	 *	public $url_remap         = array();
+	 *	public $featured_images   = array();
 	 *
 	 * @since 0.9.0
 	 * @return bool True when the streaming loop finished, false on failure.
@@ -235,6 +252,9 @@ class WP_Import extends WP_Importer {
 				$this->stream_cursor['last_entity_type'] = $entity_type;
 			}
 
+			if ( $this->defer_entity_until_term_meta_applied( $entity_type, $data ) ) {
+				continue;
+			}
 			switch ( $entity_type ) {
 				case 'site_option':
 					if ( empty( $data['option_name'] ) ) {
@@ -283,8 +303,6 @@ class WP_Import extends WP_Importer {
 					break;
 
 				case 'category':
-					$this->finalize_stream_term_meta();
-
 					$category = array(
 						'category_nicename'    => isset( $data['category_nicename'] ) ? $data['category_nicename'] : ( isset( $data['slug'] ) ? $data['slug'] : '' ),
 						'category_parent'      => isset( $data['category_parent'] ) ? $data['category_parent'] : ( isset( $data['parent'] ) ? $data['parent'] : '' ),
@@ -316,8 +334,6 @@ class WP_Import extends WP_Importer {
 					break;
 
 				case 'tag':
-					$this->finalize_stream_term_meta();
-
 					$tag = array(
 						'tag_slug'        => isset( $data['tag_slug'] ) ? $data['tag_slug'] : ( isset( $data['slug'] ) ? $data['slug'] : '' ),
 						'tag_name'        => isset( $data['tag_name'] ) ? $data['tag_name'] : ( isset( $data['name'] ) ? $data['name'] : '' ),
@@ -348,8 +364,6 @@ class WP_Import extends WP_Importer {
 					break;
 
 				case 'term':
-					$this->finalize_stream_term_meta();
-
 					$term = array(
 						'term_id'          => isset( $data['term_id'] ) ? $data['term_id'] : ( isset( $data['ID'] ) ? $data['ID'] : 0 ),
 						'term_taxonomy'    => isset( $data['term_taxonomy'] ) ? $data['term_taxonomy'] : ( isset( $data['taxonomy'] ) ? $data['taxonomy'] : '' ),
@@ -396,7 +410,6 @@ class WP_Import extends WP_Importer {
 
 				case 'post':
 					$this->finalize_stream_post_context();
-					$this->finalize_stream_term_meta();
 
 					$post_data = $data;
 					if ( isset( $post_data['post_status'] ) && ! isset( $post_data['status'] ) ) {
@@ -646,7 +659,7 @@ class WP_Import extends WP_Importer {
 	 */
 	protected function finalize_stream_term_meta() {
 		if ( empty( $this->stream_cursor['last_term_context'] ) ) {
-			return;
+			return false;
 		}
 
 		if (
@@ -654,7 +667,7 @@ class WP_Import extends WP_Importer {
 			empty( $this->stream_cursor['last_term_context']['processed']['created'] )
 		) {
 			$this->stream_cursor['last_term_context'] = array();
-			return;
+			return false;
 		}
 
 		$term                                     = $this->stream_cursor['last_term_context']['term'];
@@ -662,7 +675,36 @@ class WP_Import extends WP_Importer {
 		$processed_term_id                        = $this->stream_cursor['last_term_context']['processed']['term_id'];
 		$this->stream_cursor['last_term_context'] = array();
 
-		$this->process_termmeta( $term, $processed_term_id );
+		$this->process_termmetas( $term, $processed_term_id );
+
+		return true;
+	}
+
+	/**
+	 * Ensures pending term meta is applied before continuing the stream loop.
+	 *
+	 * @param string $entity_type Current entity type being processed.
+	 * @param array  $entity_data Current entity payload.
+	 * @return bool True when the entity was deferred for later processing.
+	 */
+	protected function defer_entity_until_term_meta_applied( $entity_type, array $entity_data ) {
+		if ( 'term_meta' === $entity_type ) {
+			return false;
+		}
+
+		if ( ! $this->finalize_stream_term_meta() ) {
+			return false;
+		}
+
+		array_unshift(
+			$this->stream_cursor['pending_entities'],
+			array(
+				'type' => $entity_type,
+				'data' => $entity_data,
+			)
+		);
+
+		return true;
 	}
 
 	/**
@@ -1107,7 +1149,7 @@ class WP_Import extends WP_Importer {
 
 			$this->processed_terms[ intval( $cat['term_id'] ) ] = $processed_category['term_id'];
 			if ( $processed_category['created'] ) {
-				$this->process_termmeta( $cat, $processed_category['term_id'] );
+				$this->process_termmetas( $cat, $processed_category['term_id'] );
 			}
 		}
 
@@ -1179,7 +1221,7 @@ class WP_Import extends WP_Importer {
 			}
 
 			if ( $processed_tag['created'] ) {
-				$this->process_termmeta( $tag, $processed_tag['term_id'] );
+				$this->process_termmetas( $tag, $processed_tag['term_id'] );
 			}
 		}
 
@@ -1252,7 +1294,7 @@ class WP_Import extends WP_Importer {
 			}
 
 			if ( $processed_term['created'] ) {
-				$this->process_termmeta( $term, $processed_term['term_id'] );
+				$this->process_termmetas( $term, $processed_term['term_id'] );
 			}
 		}
 
@@ -1305,14 +1347,14 @@ class WP_Import extends WP_Importer {
 	}
 
 	/**
-	 * Add metadata to imported term.
+	 * Add metadata to an imported term.
 	 *
 	 * @since 0.6.2
 	 *
 	 * @param array $term    Term data from WXR import.
 	 * @param int   $term_id ID of the newly created term.
 	 */
-	protected function process_termmeta( $term, $term_id ) {
+	protected function process_termmetas( $term, $term_id ) {
 		if ( ! isset( $term['termmeta'] ) ) {
 			$term['termmeta'] = array();
 		}
@@ -1333,36 +1375,53 @@ class WP_Import extends WP_Importer {
 		}
 
 		foreach ( $term['termmeta'] as $meta ) {
-			/**
-			 * Filters the meta key for an imported piece of term meta.
-			 *
-			 * @since 0.6.2
-			 *
-			 * @param string $meta_key Meta key.
-			 * @param int    $term_id  ID of the newly created term.
-			 * @param array  $term     Term data from the WXR import.
-			 */
-			$key = apply_filters( 'import_term_meta_key', $meta['key'], $term_id, $term );
-			if ( ! $key ) {
-				continue;
-			}
-
-			// Export gets meta straight from the DB so could have a serialized string
-			$value = $this->maybe_unserialize( $meta['value'] );
-
-			add_term_meta( $term_id, wp_slash( $key ), wp_slash_strings_only( $value ) );
-
-			/**
-			 * Fires after term meta is imported.
-			 *
-			 * @since 0.6.2
-			 *
-			 * @param int    $term_id ID of the newly created term.
-			 * @param string $key     Meta key.
-			 * @param mixed  $value   Meta value.
-			 */
-			do_action( 'import_term_meta', $term_id, $key, $value );
+			$this->process_termmeta( $term_id, $meta, $term );
 		}
+	}
+
+	/**
+	 * Adds a single metadata entry to an imported term.
+	 *
+	 * @since 0.6.2
+	 *
+	 * @param int   $term_id ID of the newly created term.
+	 * @param array $meta    Individual meta entry.
+	 * @param array $term    Term data from the WXR import.
+	 */
+	protected function process_termmeta( $term_id, array $meta, array $term ) {
+		if ( empty( $meta['key'] ) ) {
+			return;
+		}
+
+		/**
+		 * Filters the meta key for an imported piece of term meta.
+		 *
+		 * @since 0.6.2
+		 *
+		 * @param string $meta_key Meta key.
+		 * @param int    $term_id  ID of the newly created term.
+		 * @param array  $term     Term data from the WXR import.
+		 */
+		$key = apply_filters( 'import_term_meta_key', $meta['key'], $term_id, $term );
+		if ( ! $key ) {
+			return;
+		}
+
+		// Export gets meta straight from the DB so could have a serialized string.
+		$value = $this->maybe_unserialize( isset( $meta['value'] ) ? $meta['value'] : '' );
+
+		add_term_meta( $term_id, wp_slash( $key ), wp_slash_strings_only( $value ) );
+
+		/**
+		 * Fires after term meta is imported.
+		 *
+		 * @since 0.6.2
+		 *
+		 * @param int    $term_id ID of the newly created term.
+		 * @param string $key     Meta key.
+		 * @param mixed  $value   Meta value.
+		 */
+		do_action( 'import_term_meta', $term_id, $key, $value );
 	}
 
 	/**
