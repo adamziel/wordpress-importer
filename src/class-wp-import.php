@@ -200,6 +200,8 @@ class WP_Import extends WP_Importer {
 	 *	public $url_remap         = array();
 	 *	public $featured_images   = array();
 	 *
+	 * Stream handling for $this->get_author_mapping();
+	 *
 	 * @since 0.9.0
 	 * @return bool True when the streaming loop finished, false on failure.
 	 */
