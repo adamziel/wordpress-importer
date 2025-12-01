@@ -6,7 +6,6 @@
  * @subpackage Importer
  */
 
-use WordPress\ByteStream\ReadStream\FileReadStream;
 use WordPress\DataLiberation\EntityReader\WXREntityReader;
 use WordPress\DataLiberation\ImportEntity;
 use WordPress\DataLiberation\URL\WPURL;
@@ -159,18 +158,25 @@ class WP_Import extends WP_Importer {
 		wp_suspend_cache_invalidation( true );
 		if ( $use_streaming_loop ) {
 			$this->run_entity_loop();
+
+			wp_suspend_cache_invalidation( false );
+
+			// update incorrect/missing information in the DB
+			$this->backfill_parents(); // @TODO: Process the xml multiple times, insert the parents first. Do not run UPDATE queries afterwards
+			$this->backfill_attachment_urls(); // @TODO: Process attachments before the posts, stream-rewrite attachments URLs as we go
+			$this->remap_featured_images(); // Should be solved by processing the attachments first and using the right _thumbnail_id right away on the first insert
 		} else {
 			$this->process_categories();
 			$this->process_tags();
 			$this->process_terms();
 			$this->process_posts();
-		}
-		wp_suspend_cache_invalidation( false );
+			wp_suspend_cache_invalidation( false );
 
-		// update incorrect/missing information in the DB
-		$this->backfill_parents();
-		$this->backfill_attachment_urls();
-		$this->remap_featured_images();
+			// update incorrect/missing information in the DB
+			$this->backfill_parents();
+			$this->backfill_attachment_urls();
+			$this->remap_featured_images();
+		}
 
 		$this->import_end();
 	}
@@ -205,7 +211,29 @@ class WP_Import extends WP_Importer {
 	 * @since 0.9.0
 	 * @return bool True when the streaming loop finished, false on failure.
 	 */
-	public function run_entity_loop() {
+	public function run_entity_loop( $last_cursor = null ) {
+		if ( null !== $last_cursor ) {
+			$last_cursor = json_decode( $last_cursor, true );
+			if ( false === $last_cursor ) {
+				return false;
+			}
+			$this->version = $last_cursor['version'];
+			$this->base_url = $last_cursor['base_url'];
+
+			$this->processed_authors = $last_cursor['processed_authors'];
+			$this->author_mapping = $last_cursor['author_mapping'];
+			$this->processed_terms = $last_cursor['processed_terms'];
+			$this->processed_posts = $last_cursor['processed_posts'];
+			$this->post_orphans = $last_cursor['post_orphans'];
+			$this->processed_menu_items = $last_cursor['processed_menu_items'];
+			$this->menu_item_orphans = $last_cursor['menu_item_orphans'];
+			$this->missing_menu_items = $last_cursor['missing_menu_items'];
+			$this->fetch_attachments = $last_cursor['fetch_attachments'];
+			$this->options = $last_cursor['options'];
+			$this->import_file = $last_cursor['import_file'];
+			$this->stream_cursor = $last_cursor['stream_cursor'];
+		}
+
 		if ( empty( $this->import_file ) || ! is_readable( $this->import_file ) ) {
 			return false;
 		}
@@ -634,6 +662,26 @@ class WP_Import extends WP_Importer {
 					}
 					break;
 			}
+
+			// Save the cursor state to the database
+			update_option( 'wp_import_cursor', json_encode( array(
+				'id' => $this->stream_cursor,
+				'version' => $this->version,
+				'base_url' => $this->base_url,
+
+				'processed_authors' => $this->processed_authors,
+				'author_mapping' => $this->author_mapping,
+				'processed_terms' => $this->processed_terms,
+				'processed_posts' => $this->processed_posts,
+				'post_orphans' => $this->post_orphans,
+				'processed_menu_items' => $this->processed_menu_items,
+				'menu_item_orphans' => $this->menu_item_orphans,
+				'missing_menu_items' => $this->missing_menu_items,
+				'fetch_attachments' => $this->fetch_attachments,
+				'options' => $this->fetch_attachments,
+				'import_file' => $this->fetch_attachments,
+				'stream_cursor' => $this->stream_cursor,
+			) ) );
 		}
 
 		$this->finalize_stream_post_context();
