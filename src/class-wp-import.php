@@ -581,7 +581,7 @@ class WP_Import extends WP_Importer {
 							$this->stream_cursor['post_context']['comment_id_map'][ $original_comment_id ] = $inserted_comment_id;
 						}
 
-						$this->apply_pending_comment_meta_for( $original_comment_id, $inserted_comment_id );
+						$this->enqueue_comment_meta( $original_comment_id, $inserted_comment_id );
 					}
 					break;
 
@@ -598,7 +598,7 @@ class WP_Import extends WP_Importer {
 
 					if ( isset( $this->stream_cursor['post_context']['comment_id_map'][ $original_comment_id ] ) ) {
 						$this->stream_cursor['pending_entities'][] = array(
-							'type' => 'apply_comment_meta',
+							'type' => 'enqueued_comment_meta',
 							'data' => array(
 								'comment_id' => $this->stream_cursor['post_context']['comment_id_map'][ $original_comment_id ],
 								'meta'       => array(
@@ -620,7 +620,7 @@ class WP_Import extends WP_Importer {
 					);
 					break;
 
-				case 'apply_comment_meta':
+				case 'enqueued_comment_meta':
 					$applied_comment_id = isset( $data['comment_id'] ) ? (int) $data['comment_id'] : 0;
 					$meta               = isset( $data['meta'] ) && is_array( $data['meta'] ) ? $data['meta'] : null;
 					if ( $applied_comment_id && $meta && isset( $meta['key'] ) ) {
@@ -715,7 +715,7 @@ class WP_Import extends WP_Importer {
 	 * @param int|null $original_comment_id Original comment ID from the WXR file.
 	 * @param int      $inserted_comment_id Newly inserted comment ID.
 	 */
-	private function apply_pending_comment_meta_for( $original_comment_id, $inserted_comment_id ) {
+	private function enqueue_comment_meta( $original_comment_id, $inserted_comment_id ) {
 		if ( null === $original_comment_id ) {
 			return;
 		}
@@ -726,7 +726,7 @@ class WP_Import extends WP_Importer {
 
 		foreach ( $this->stream_cursor['post_context']['pending_comment_meta'][ $original_comment_id ] as $meta ) {
 			$this->stream_cursor['pending_entities'][] = array(
-				'type' => 'apply_comment_meta',
+				'type' => 'enqueued_comment_meta',
 				'data' => array(
 					'comment_id' => $inserted_comment_id,
 					'meta'       => $meta,
