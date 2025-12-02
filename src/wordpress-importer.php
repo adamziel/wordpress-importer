@@ -14,6 +14,9 @@
  * License URI:       https://www.gnu.org/licenses/gpl-2.0.html
  */
 
+/** Admin bar reset button for clearing imported content. */
+require_once __DIR__ . '/reset-button.php';
+
 if ( ! defined( 'WP_LOAD_IMPORTERS' ) ) {
 	return;
 }

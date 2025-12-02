@@ -303,7 +303,7 @@ https://playground.internal/path-not-taken was the second best choice.
 			);
 			expect(reply).toBeTruthy();
 			expect(parentComment).toBeTruthy();
-			expect(reply.parent).toBe(8002);
+			expect(reply.parent).toBe(parentComment.id);
 		},
 	},
 ];
@@ -546,7 +546,7 @@ async function startPlayground(parser = null) {
 test.describe('Streaming Entity Loop', () => {
 	STREAMING_PARSERS.forEach((parser) => {
 		test.describe(`with ${parser} parser`, () => {
-			FIXTURES.filter((fixture) => fixture.name === 'post-processing').forEach((fixture) => {
+			FIXTURES.forEach((fixture) => {
 				test.only(`imports ${fixture.name} fixture using streaming loop`, async ({
 					page,
 					request,

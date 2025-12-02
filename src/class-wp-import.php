@@ -390,7 +390,16 @@ class WP_Import extends WP_Importer {
 			 */
 			if ( $this->first_full_run_done ) {
 				if( $this->is_topologically_skipped( $this->stream_cursor['last_entity_index'] )) {
-					$this->topologically_unskip_entity();
+					$metadata = $this->topologically_unskip_entity();
+					if ( isset( $metadata['current_post_id'] ) ) {
+						$this->stream_cursor['current_post_id'] = $metadata['current_post_id'];
+					}
+					if ( isset( $metadata['current_comment_post_id'] ) ) {
+						$this->stream_cursor['current_comment_post_id'] = $metadata['current_comment_post_id'];
+					}
+					if ( isset( $metadata['current_post_exists'] ) ) {
+						$this->stream_cursor['current_post_exists'] = $metadata['current_post_exists'];
+					}
 				} else {
 					return null;
 				}
@@ -735,6 +744,7 @@ class WP_Import extends WP_Importer {
 
 			case 'comment':
 				if ( empty( $this->stream_cursor['current_post_id'] ) ) {
+					var_dump(' skipping comment: no current post id ');
 					break;
 				}
 
@@ -742,7 +752,12 @@ class WP_Import extends WP_Importer {
 				$comment_parent      = isset( $data['comment_parent'] ) ? (int) $data['comment_parent'] : 0;
 				if ( $comment_parent > 0 && ! isset( $this->processed_comments[ $comment_parent ] ) ) {
 					var_dump(' topologically skipping comment: ' . $original_comment_id . ' (parent: ' . $comment_parent . ')');
-					$this->topological_skip_entity();
+					var_dump(['processed_comments' => $this->processed_comments]);
+					$this->topological_skip_entity( array(
+						'current_post_id'         => $this->stream_cursor['current_post_id'],
+						'current_comment_post_id' => $this->stream_cursor['current_comment_post_id'],
+						'current_post_exists'     => $this->stream_cursor['current_post_exists'],
+					) );
 					// Make sure the following meta won't be associated with this comment
 					$this->stream_cursor['last_comment_id'] = null;
 					return;
@@ -838,24 +853,33 @@ class WP_Import extends WP_Importer {
 		return false;
 	}
 
-	private function topological_skip_entity() {
+	private function topological_skip_entity( $metadata = array() ) {
 		$entity_index = $this->stream_cursor['last_entity_index'];
 		if ( ! count( $this->topologically_skipped_ranges ) ) {
 			$this->topologically_skipped_ranges[] = array(
-				'start' => $entity_index,
-				'end' => $entity_index,
+				'start'    => $entity_index,
+				'end'      => $entity_index,
+				'metadata' => $metadata,
 			);
 			return;
 		}
-		$last_skipped_range = $this->topologically_skipped_ranges[ count($this->topologically_skipped_ranges) - 1 ];
-		if ( $last_skipped_range['end'] === $entity_index - 1 ) {
-			$last_skipped_range['end'] = $entity_index;
+
+		$last_index = count( $this->topologically_skipped_ranges ) - 1;
+		$last_range = $this->topologically_skipped_ranges[ $last_index ];
+
+		// Only extend the last range if it's consecutive AND has the same metadata.
+		if (
+			$last_range['end'] === $entity_index - 1 &&
+			$last_range['metadata'] === $metadata
+		) {
+			$this->topologically_skipped_ranges[ $last_index ]['end'] = $entity_index;
 			return;
 		}
 
 		$this->topologically_skipped_ranges[] = array(
-			'start' => $entity_index,
-			'end' => $entity_index,
+			'start'    => $entity_index,
+			'end'      => $entity_index,
+			'metadata' => $metadata,
 		);
 	}
 
@@ -892,32 +916,34 @@ class WP_Import extends WP_Importer {
 			// Single-element range – remove it entirely.
 			if ( $range['start'] === $range['end'] ) {
 				array_splice( $ranges, $i, 1 );
-				return;
+				return $range['metadata'];
 			}
 
 			// Entity is at the start of the range – shrink from the left.
 			if ( $entity_index === $range['start'] ) {
 				$ranges[ $i ]['start'] = $entity_index + 1;
-				return;
+				return $range['metadata'];
 			}
 
 			// Entity is at the end of the range – shrink from the right.
 			if ( $entity_index === $range['end'] ) {
 				$ranges[ $i ]['end'] = $entity_index - 1;
-				return;
+				return $range['metadata'];
 			}
 
-			// Entity is in the middle – split into two ranges.
+			// Entity is in the middle – split into two ranges, preserving metadata.
 			$left_range = array(
-				'start' => $range['start'],
-				'end'   => $entity_index - 1,
+				'start'    => $range['start'],
+				'end'      => $entity_index - 1,
+				'metadata' => $range['metadata'],
 			);
 			$right_range = array(
-				'start' => $entity_index + 1,
-				'end'   => $range['end'],
+				'start'    => $entity_index + 1,
+				'end'      => $range['end'],
+				'metadata' => $range['metadata'],
 			);
 			array_splice( $ranges, $i, 1, array( $left_range, $right_range ) );
-			return;
+			return $range['metadata'];
 		}
 	}
 
