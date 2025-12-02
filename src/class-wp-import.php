@@ -35,6 +35,7 @@ class WP_Import extends WP_Importer {
 	public $author_mapping       = array();
 	public $processed_terms      = array();
 	public $processed_posts      = array();
+	public $processed_comments   = array();
 	public $post_orphans         = array();
 	public $processed_menu_items = array();
 	public $menu_item_orphans    = array();
@@ -167,7 +168,7 @@ class WP_Import extends WP_Importer {
 			wp_suspend_cache_invalidation( false );
 
 			// update incorrect/missing information in the DB
-			$this->backfill_parents(); // @TODO: Process the xml multiple times, insert the parents first. Do not run UPDATE queries afterwards
+			// $this->backfill_parents(); // Topological insertion of parents takes care of this now
 			$this->backfill_attachment_urls(); // @TODO: Process attachments before the posts, stream-rewrite attachments URLs as we go
 			$this->remap_featured_images(); // Should be solved by processing the attachments first and using the right _thumbnail_id right away on the first insert
 		} else {
@@ -346,6 +347,11 @@ class WP_Import extends WP_Importer {
 			$this->save_cursor();
 
 			$skipped_after = $this->count_skipped_entities();
+			var_dump([
+				'skipped_after' => $skipped_after,
+				'topologically_skipped_before' => $this->topologically_skipped_before,
+			]);
+			var_dump($this->topologically_skipped_ranges);
 			if ( $skipped_after === $this->topologically_skipped_before || $skipped_after === 0 ) {
 				// The latest run did not process any more entities. The next
 				// run will not process any more entities either. We're done.
@@ -394,6 +400,7 @@ class WP_Import extends WP_Importer {
 			if ( ! $entity instanceof ImportEntity ) {
 				// TODO: Handle error. Why would get_entity() return anything else, though?
 				$this->finalize_stream_post_context();
+				var_dump(' ENTITY NOT INSTANCE OF ImportEntity, returning null');
 				return;
 			}
 
@@ -733,8 +740,11 @@ class WP_Import extends WP_Importer {
 
 				$original_comment_id = isset( $data['comment_id'] ) ? intval( $data['comment_id'] ) : null;
 				$comment_parent      = isset( $data['comment_parent'] ) ? (int) $data['comment_parent'] : 0;
-				if ( $comment_parent > 0 && ! isset( $this->stream_cursor['post_context']['comment_id_map'][ $comment_parent ] ) ) {
+				if ( $comment_parent > 0 && ! isset( $this->processed_comments[ $comment_parent ] ) ) {
+					var_dump(' topologically skipping comment: ' . $original_comment_id . ' (parent: ' . $comment_parent . ')');
 					$this->topological_skip_entity();
+					// Make sure the following meta won't be associated with this comment
+					$this->stream_cursor['last_comment_id'] = null;
 					return;
 				}
 
@@ -749,9 +759,10 @@ class WP_Import extends WP_Importer {
 					'comment_content'      => isset( $data['comment_content'] ) ? $data['comment_content'] : '',
 					'comment_approved'     => isset( $data['comment_approved'] ) ? $data['comment_approved'] : 1,
 					'comment_type'         => isset( $data['comment_type'] ) ? $data['comment_type'] : '',
-					'comment_parent'       => $comment_parent > 0 ? $this->stream_cursor['post_context']['comment_id_map'][ $comment_parent ] : $comment_parent,
+					'comment_parent'       => $comment_parent > 0 ? $this->processed_comments[ $comment_parent ] : $comment_parent,
 					'commentmeta'          => array(),
 				);
+				var_dump(' processing comment: ' . $original_comment_id . ' (parent: ' . $comment_parent . ')');
 
 				if ( isset( $data['comment_user_id'] ) && isset( $this->processed_authors[ $data['comment_user_id'] ] ) ) {
 					$comment['user_id'] = $this->processed_authors[ $data['comment_user_id'] ];
@@ -768,7 +779,7 @@ class WP_Import extends WP_Importer {
 					// @TODO: Replace an array-based comment ID map with a storage format that
 					//        would support 10 million comments without going out of memory.
 					//        E.g. a separate table, an SQLite database, a filesystem-based trie, etc.
-					$this->stream_cursor['post_context']['comment_id_map'][ $original_comment_id ] = $inserted_comment_id;
+					$this->processed_comments[ $original_comment_id ] = $inserted_comment_id;
 
 					// The current comment entity may carry some meta entries – let's defer processing
 					// them to the future passes of this loop:
@@ -850,6 +861,7 @@ class WP_Import extends WP_Importer {
 
 	private function topologically_unskip_entity() {
 		$entity_index = $this->stream_cursor['last_entity_index'];
+		var_dump(' topologically unskipping entity: ' . $entity_index);
 		$ranges = &$this->topologically_skipped_ranges;
 
 		for ( $i = 0; $i < count( $ranges ); $i++ ) {
@@ -927,6 +939,7 @@ class WP_Import extends WP_Importer {
 			'author_mapping' => $this->author_mapping,
 			'processed_terms' => $this->processed_terms,
 			'processed_posts' => $this->processed_posts,
+			'processed_comments' => $this->processed_comments,
 			'post_orphans' => $this->post_orphans,
 			'processed_menu_items' => $this->processed_menu_items,
 			'menu_item_orphans' => $this->menu_item_orphans,
@@ -959,6 +972,7 @@ class WP_Import extends WP_Importer {
 		$this->author_mapping = $last_cursor['author_mapping'];
 		$this->processed_terms = $last_cursor['processed_terms'];
 		$this->processed_posts = $last_cursor['processed_posts'];
+		$this->processed_comments = $last_cursor['processed_comments'];
 		$this->post_orphans = $last_cursor['post_orphans'];
 		$this->processed_menu_items = $last_cursor['processed_menu_items'];
 		$this->menu_item_orphans = $last_cursor['menu_item_orphans'];
