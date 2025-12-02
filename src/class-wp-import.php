@@ -382,9 +382,7 @@ class WP_Import extends WP_Importer {
 			 * want to continue processing entities that were topologically skipped
 			 * before.
 			 */
-			if (
-				$this->first_full_run_done
-			) {
+			if ( $this->first_full_run_done ) {
 				if( $this->is_topologically_skipped( $this->stream_cursor['last_entity_index'] )) {
 					$this->topologically_unskip_entity();
 				} else {
@@ -622,7 +620,8 @@ class WP_Import extends WP_Importer {
 						$this->topological_skip_entity();
 						return;
 					}
-					$post['post_parent'] = $this->processed_posts[ $post_parent ];
+					// Imported parent ID => new parent ID translation is handled in the process_post()
+					// method, so we don't need to do anything else here.
 				}
 
 				if ( empty( $post['status'] ) ) {
