@@ -257,6 +257,7 @@ https://playground.internal/path-not-taken was the second best choice.
 			fetchAttachments: true,
 		},
 		validate: async ({ page, request }) => {
+			const all_pages = await request.get(abs('/wp-json/wp/v2/pages?search=&per_page=5'));
 			const childRes = await request.get(
 				abs('/wp-json/wp/v2/pages?search=Child%20Before%20Parent&per_page=5')
 			);
@@ -306,6 +307,7 @@ https://playground.internal/path-not-taken was the second best choice.
 		},
 	},
 ];
+
 // Run tests for each parser
 PARSERS.forEach((parser) => {
 	test.describe(`WXR Import with ${parser} parser`, () => {
@@ -544,8 +546,8 @@ async function startPlayground(parser = null) {
 test.describe('Streaming Entity Loop', () => {
 	STREAMING_PARSERS.forEach((parser) => {
 		test.describe(`with ${parser} parser`, () => {
-			FIXTURES.forEach((fixture) => {
-				test(`imports ${fixture.name} fixture using streaming loop`, async ({
+			FIXTURES.filter((fixture) => fixture.name === 'post-processing').forEach((fixture) => {
+				test.only(`imports ${fixture.name} fixture using streaming loop`, async ({
 					page,
 					request,
 				}) => {

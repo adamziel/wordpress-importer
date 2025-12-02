@@ -67,6 +67,11 @@ class WP_Import extends WP_Importer {
 	 */
 	protected $stream_cursor = array();
 
+	// @TODO: A serializable $this->state object would make a great cursor.
+	//        It would contain both the stream cursor and the global importer state.
+	private $topologically_skipped_ranges = array();
+	private $first_full_run_done = false;
+
 	/**
 	 * Registered callback function for the WordPress Importer
 	 *
@@ -184,17 +189,18 @@ class WP_Import extends WP_Importer {
 	public function run_import_loop() {
 		// Stages:
 		// 1. Fetch all the attachments
-		$this->restore_from_last_cursor();
-		if ( empty( $this->import_file ) || ! is_readable( $this->import_file ) ) {
-			return false;
-		}
+		// $this->restore_from_last_cursor();
+		// if ( empty( $this->import_file ) || ! is_readable( $this->import_file ) ) {
+		// 	return false;
+		// }
 
-		if ( $this->fetch_attachments ) {
+		if ( $this->fetch_attachments) {
 			$this->frontload_attachments();
 		}
 
 		// 2. Topologically import all the entities. Go through the XML file as many times as
 		//    needed to import everything.
+		$this->run_topological_entity_loop();
 
 	}
 
@@ -318,59 +324,39 @@ class WP_Import extends WP_Importer {
 	 * the execution flow explicit and resume-friendly. This bypasses the legacy
 	 * aggregate filters (`wp_import_tags`, `wp_import_posts`, etc.) because they
 	 * require loading the full dataset into memory.
-	 * 
-	 * TODO:
-	 * 
-	 * Stream handling for those properties:
-	 * 
-	 *	public $processed_authors    = array();
-	 *	public $author_mapping       = array();
-	 *	public $processed_terms      = array();
-	 *	public $processed_posts      = array();
-	 *	public $post_orphans         = array();
-	 *	public $processed_menu_items = array();
-	 *	public $menu_item_orphans    = array();
-	 *	public $missing_menu_items   = array();
-	 *
-	 *	public $fetch_attachments = false;
-	 *	public $url_remap         = array();
-	 *	public $featured_images   = array();
-	 *
-	 * Stream handling for $this->get_author_mapping();
 	 *
 	 * @since 0.9.0
 	 * @return bool True when the streaming loop finished, false on failure.
 	 */
+	private $topologically_skipped_before = null;
 	private function run_topological_entity_loop() {
+		$reader = WXREntityReader::create_for_wordpress_importer( $this->import_file, $this->stream_cursor['wxr_cursor'] ?? null );
+		if ( ! $reader ) {
+			return false;
+		}
+
 		while ( true ) {
+			if ( $this->first_full_run_done ) {
+				$this->topologically_skipped_before = $this->count_skipped_entities();
+			}
+			while ( false !== $this->stream_topological_import_next_entity( $reader ) ) {
+				// twiddle our thumbs...
+			}
+			$this->first_full_run_done = true;
+			$this->save_cursor();
+
+			$skipped_after = $this->count_skipped_entities();
+			if ( $skipped_after === $this->topologically_skipped_before || $skipped_after === 0 ) {
+				// The latest run did not process any more entities. The next
+				// run will not process any more entities either. We're done.
+				break;
+			}
+
 			$reader = WXREntityReader::create_for_wordpress_importer( $this->import_file );
 			if ( ! $reader ) {
 				return false;
 			}
-
-			// TODO: Rewind to the last cursor position
-			while ( $this->stream_topological_import_next_entity( $reader ) ) {
-				// twiddle our thumbs...
-			}
-
-			// ...see how many skipped topological dependencies...
-			// ...rerun on just those skipped entities...
-			//
-			// How can we remember which entities we skipped without
-			// overwhelming the database on large imports?
-			// It seems like we need a set of indexes/hashes of the entities to
-			// skip, OR a way to compute entity "depth". The latter
-			// is not trivial, though.
-			//
-			// What can we expect?
-			// 10MB -> 16442 entities = ~ 16k int64s = 128KB
-			// 10GB -> 164420000 entities = ~ 164M int64s = 1,312MB = 1.28GB
-			//
-			// We could also use a bitmap to remember which entities we skipped.
-			// Or even save ranges of unprocessed entities. We start with a range
-			// (0 – n), when we process entity 1 we update it to (1 to n) etc.
-			//
-			// Or, do the inverse – only store ranges of skipped entities.
+			$this->initialize_empty_stream_cursor();
 		}
 
 		return true;
@@ -384,14 +370,33 @@ class WP_Import extends WP_Importer {
 		} else {
 			if ( ! $reader->next_entity() ) {
 				$this->finalize_stream_post_context();
+				$this->first_full_run_done = true;
+				$this->save_cursor();
 				return false;
+			}
+			$this->stream_cursor['wxr_cursor'] = $reader->get_reentrancy_cursor();
+			++$this->stream_cursor['last_entity_index'];
+
+			/**
+			 * Once we've processed the full data set for the first time, we only
+			 * want to continue processing entities that were topologically skipped
+			 * before.
+			 */
+			if (
+				$this->first_full_run_done
+			) {
+				if( $this->is_topologically_skipped( $this->stream_cursor['last_entity_index'] )) {
+					$this->topologically_unskip_entity();
+				} else {
+					return null;
+				}
 			}
 
 			$entity = $reader->get_entity();
 			if ( ! $entity instanceof ImportEntity ) {
 				// TODO: Handle error. Why would get_entity() return anything else, though?
 				$this->finalize_stream_post_context();
-				return false;
+				return;
 			}
 
 			$data                                    = $entity->get_data();
@@ -614,12 +619,8 @@ class WP_Import extends WP_Importer {
 				$post_parent = isset( $post['post_parent'] ) ? (int) $post['post_parent'] : 0;
 				if ( $post_parent > 0 ) {
 					if ( ! isset( $this->processed_posts[ $post_parent ] ) ) {
-						// Topological dependency: skip this post until we have processed the parent post.
-						// We don't need to do anything extra. The next loop pass will process this post
-						// once the parent post is processed. If the parent post is missing from the
-						// import file, it will be clear at the end of the process when the number of indexed
-						// posts does not match the number of inserted posts.
-						continue;
+						$this->topological_skip_entity();
+						return;
 					}
 					$post['post_parent'] = $this->processed_posts[ $post_parent ];
 				}
@@ -734,12 +735,8 @@ class WP_Import extends WP_Importer {
 				$original_comment_id = isset( $data['comment_id'] ) ? intval( $data['comment_id'] ) : null;
 				$comment_parent      = isset( $data['comment_parent'] ) ? (int) $data['comment_parent'] : 0;
 				if ( $comment_parent > 0 && ! isset( $this->stream_cursor['post_context']['comment_id_map'][ $comment_parent ] ) ) {
-					// Topological dependency: skip this comment until we have processed the parent comment.
-					// We don't need to do anything extra. The next loop pass will process this comment
-					// once the parent comment is processed. If the parent comment is missing from the
-					// import file, it will be clear at the end of the process when the number of indexed
-					// comments does not match the number of inserted comments.
-					continue;
+					$this->topological_skip_entity();
+					return;
 				}
 
 				$comment             = array(
@@ -822,6 +819,105 @@ class WP_Import extends WP_Importer {
 		return true;
 	}
 
+	private function is_topologically_skipped( $entity_index ) {
+		foreach ( $this->topologically_skipped_ranges as $range ) {
+			if ( $entity_index >= $range['start'] && $entity_index <= $range['end'] ) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private function topological_skip_entity() {
+		$entity_index = $this->stream_cursor['last_entity_index'];
+		if ( ! count( $this->topologically_skipped_ranges ) ) {
+			$this->topologically_skipped_ranges[] = array(
+				'start' => $entity_index,
+				'end' => $entity_index,
+			);
+			return;
+		}
+		$last_skipped_range = $this->topologically_skipped_ranges[ count($this->topologically_skipped_ranges) - 1 ];
+		if ( $last_skipped_range['end'] === $entity_index - 1 ) {
+			$last_skipped_range['end'] = $entity_index;
+			return;
+		}
+
+		$this->topologically_skipped_ranges[] = array(
+			'start' => $entity_index,
+			'end' => $entity_index,
+		);
+	}
+
+	private function topologically_unskip_entity() {
+		$entity_index = $this->stream_cursor['last_entity_index'];
+		$ranges = &$this->topologically_skipped_ranges;
+
+		for ( $i = 0; $i < count( $ranges ); $i++ ) {
+			$range = $ranges[ $i ];
+
+			if ( $entity_index > $range['end'] ) {
+				continue;
+			}
+
+			/**
+			 * We've reached a range that starts after the entity we're trying to unskip.
+			 * This means the entity was not skipped in the first place.
+			 * 
+			 * For example:
+			 * 
+			 * [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+			 * [         x                  ] ← entity_index
+			 * [<----->        <-->         ] ← ranges
+			 * 
+			 * After skipping the first range (0, 2), we inspect the second range (5, 6).
+			 * The entity 3 is below the range. This means all the remaining ranges we'll see
+			 * will also start after the entity. This, we can stop processing ranges.
+			 */
+			if ( $entity_index < $range['start'] ) {
+				break;
+			}
+
+			// Single-element range – remove it entirely.
+			if ( $range['start'] === $range['end'] ) {
+				array_splice( $ranges, $i, 1 );
+				return;
+			}
+
+			// Entity is at the start of the range – shrink from the left.
+			if ( $entity_index === $range['start'] ) {
+				$ranges[ $i ]['start'] = $entity_index + 1;
+				return;
+			}
+
+			// Entity is at the end of the range – shrink from the right.
+			if ( $entity_index === $range['end'] ) {
+				$ranges[ $i ]['end'] = $entity_index - 1;
+				return;
+			}
+
+			// Entity is in the middle – split into two ranges.
+			$left_range = array(
+				'start' => $range['start'],
+				'end'   => $entity_index - 1,
+			);
+			$right_range = array(
+				'start' => $entity_index + 1,
+				'end'   => $range['end'],
+			);
+			array_splice( $ranges, $i, 1, array( $left_range, $right_range ) );
+			return;
+		}
+	}
+
+	private function count_skipped_entities() {
+		$count = 0;
+		foreach ( $this->topologically_skipped_ranges as $range ) {
+			$count += $range['end'] - $range['start'] + 1;
+		}
+		return $count;
+	}
+
 	private function save_cursor() {
 		update_option( 'wp_import_cursor', json_encode( array(
 			'id' => $this->stream_cursor,
@@ -837,21 +933,23 @@ class WP_Import extends WP_Importer {
 			'menu_item_orphans' => $this->menu_item_orphans,
 			'missing_menu_items' => $this->missing_menu_items,
 			'fetch_attachments' => $this->fetch_attachments,
-			'options' => $this->fetch_attachments,
-			'import_file' => $this->fetch_attachments,
+			'options' => $this->options,
+			'import_file' => $this->import_file,
 			'stream_cursor' => $this->stream_cursor,
+			'first_full_run_done' => $this->first_full_run_done,
+			'topologically_skipped_before' => $this->topologically_skipped_before,
 		) ) );
 	}
 
 	private function restore_from_last_cursor() {
 		$last_cursor = get_option( 'wp_import_cursor' );
 		if ( false === $last_cursor ) {
-			$this->initialize_empty_cursor();
+			$this->initialize_empty_stream_cursor();
 			return false;
 		}
 		$last_cursor = json_decode( $last_cursor, true );
 		if ( false === $last_cursor ) {
-			$this->initialize_empty_cursor();
+			$this->initialize_empty_stream_cursor();
 			return false;
 		}
 
@@ -870,25 +968,29 @@ class WP_Import extends WP_Importer {
 		$this->options = $last_cursor['options'];
 		$this->import_file = $last_cursor['import_file'];
 		$this->stream_cursor = $last_cursor['stream_cursor'];
+		$this->first_full_run_done = $last_cursor['first_full_run_done'];
+		$this->topologically_skipped_before = $last_cursor['topologically_skipped_before'];
 		return true;
 	}
 
-	private function initialize_empty_cursor() {
+	private function initialize_empty_stream_cursor() {
 		$this->stream_cursor = array(
-			'last_entity_type'        => null,
-			'last_post_id'            => null,
-			'last_comment_id'         => null,
-			'last_term_id'            => null,
-			'current_post_id'         => null,
-			'current_comment_post_id' => null,
-			'current_post_exists'     => null,
-			'post_context'            => array(
-				'post'                 => null,
-				'comment_id_map'       => array(),
-				'pending_comment_meta' => array(),
+			'wxr_cursor' => null,
+			'last_entity_index'            => 0,
+			'last_entity_type'             => null,
+			'last_post_id'                 => null,
+			'last_comment_id'              => null,
+			'last_term_id'                 => null,
+			'current_post_id'              => null,
+			'current_comment_post_id'      => null,
+			'current_post_exists'          => null,
+			'post_context'                 => array(
+				'post'                     => null,
+				'comment_id_map'           => array(),
+				'pending_comment_meta'     => array(),
 			),
-			'last_term_context'       => array(),
-			'pending_entities'        => array(),
+			'last_term_context'            => array(),
+			'pending_entities'             => array(),
 		);
 	}
 
