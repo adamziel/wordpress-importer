@@ -35,6 +35,7 @@ class WP_Import extends WP_Importer {
 	public $author_mapping       = array();
 	public $processed_terms      = array();
 	public $processed_posts      = array();
+	public $processed_comments   = array();
 	public $post_orphans         = array();
 	public $processed_menu_items = array();
 	public $menu_item_orphans    = array();
@@ -66,6 +67,11 @@ class WP_Import extends WP_Importer {
 	 * @var array
 	 */
 	protected $stream_cursor = array();
+
+	// @TODO: A serializable $this->state object would make a great cursor.
+	//        It would contain both the stream cursor and the global importer state.
+	private $topologically_skipped_ranges = array();
+	private $first_full_run_done = false;
 
 	/**
 	 * Registered callback function for the WordPress Importer
@@ -157,14 +163,13 @@ class WP_Import extends WP_Importer {
 
 		wp_suspend_cache_invalidation( true );
 		if ( $use_streaming_loop ) {
-			$this->run_entity_loop();
+			$this->run_topological_entity_loop();
 
 			wp_suspend_cache_invalidation( false );
 
-			// update incorrect/missing information in the DB
-			$this->backfill_parents(); // @TODO: Process the xml multiple times, insert the parents first. Do not run UPDATE queries afterwards
-			$this->backfill_attachment_urls(); // @TODO: Process attachments before the posts, stream-rewrite attachments URLs as we go
-			$this->remap_featured_images(); // Should be solved by processing the attachments first and using the right _thumbnail_id right away on the first insert
+			// Topological insertion handles parent relationships.
+			// Inline URL rewriting during post insertion handles attachment URLs.
+			$this->remap_featured_images();
 		} else {
 			$this->process_categories();
 			$this->process_tags();
@@ -181,6 +186,210 @@ class WP_Import extends WP_Importer {
 		$this->import_end();
 	}
 
+	public function run_import_loop() {
+		// Stages:
+		// 1. Fetch all the attachments
+		// $this->restore_from_last_cursor();
+		// if ( empty( $this->import_file ) || ! is_readable( $this->import_file ) ) {
+		// 	return false;
+		// }
+
+		if ( $this->fetch_attachments) {
+			$this->frontload_attachments();
+		}
+
+		// 2. Topologically import all the entities. Go through the XML file as many times as
+		//    needed to import everything.
+		$this->run_topological_entity_loop();
+
+	}
+
+	/**
+	 * Get the directory for URL mapping index files.
+	 */
+	private function get_url_index_dir() {
+		$uploads = wp_upload_dir();
+		if ( ! ( $uploads && false === $uploads['error'] ) ) {
+			return false;
+		}
+		return $uploads['basedir'] . '/wordpress-importer-url-index';
+	}
+
+	/**
+	 * Normalize a URL for comparison by removing query params and fragments.
+	 */
+	private function normalize_url_for_index( $url ) {
+		$parsed = parse_url( $url );
+		$normalized = '';
+		if ( isset( $parsed['scheme'] ) ) {
+			$normalized .= $parsed['scheme'] . '://';
+		}
+		if ( isset( $parsed['host'] ) ) {
+			$normalized .= $parsed['host'];
+		}
+		if ( isset( $parsed['port'] ) ) {
+			$normalized .= ':' . $parsed['port'];
+		}
+		if ( isset( $parsed['path'] ) ) {
+			$normalized .= $parsed['path'];
+		}
+		return $normalized;
+	}
+
+	/**
+	 * Store the new URL mapping for an attachment.
+	 */
+	private function store_url_mapping( $original_url, $new_url ) {
+		$index_dir = $this->get_url_index_dir();
+		if ( ! $index_dir ) {
+			return false;
+		}
+		if ( ! is_dir( $index_dir ) ) {
+			mkdir( $index_dir, 0755, true );
+		}
+		$normalized = $this->normalize_url_for_index( $original_url );
+		$index_file = $index_dir . '/' . base64_encode( $normalized ) . '.txt';
+		return file_put_contents( $index_file, $new_url );
+	}
+
+	/**
+	 * Get the new URL for an original attachment URL.
+	 */
+	private function get_mapped_url( $original_url ) {
+		$index_dir = $this->get_url_index_dir();
+		if ( ! $index_dir ) {
+			return false;
+		}
+		$normalized = $this->normalize_url_for_index( $original_url );
+		$index_file = $index_dir . '/' . base64_encode( $normalized ) . '.txt';
+		if ( ! file_exists( $index_file ) ) {
+			return false;
+		}
+		return trim( file_get_contents( $index_file ) );
+	}
+
+	/**
+	 * Build a URL mapping array from all indexed attachments.
+	 * Returns an array of [ original_url => new_url ].
+	 */
+	private function get_all_url_mappings() {
+		$index_dir = $this->get_url_index_dir();
+		if ( ! $index_dir || ! is_dir( $index_dir ) ) {
+			return array();
+		}
+
+		$mapping = array();
+		$files = glob( $index_dir . '/*.txt' );
+		foreach ( $files as $file ) {
+			$encoded = basename( $file, '.txt' );
+			$original_url = base64_decode( $encoded );
+			$new_url = trim( file_get_contents( $file ) );
+			if ( $original_url && $new_url ) {
+				$mapping[ $original_url ] = $new_url;
+			}
+		}
+		return $mapping;
+	}
+
+	/**
+	 * Rewrite asset URLs in content using the URL mapping index.
+	 * Handles image URLs with various sizes by matching the base path.
+	 */
+	private function rewrite_attachment_urls( $content ) {
+		$mapping = $this->get_all_url_mappings();
+		if ( empty( $mapping ) ) {
+			return $content;
+		}
+
+		// Sort by URL length descending to handle substrings correctly.
+		uksort( $mapping, function( $a, $b ) {
+			return strlen( $b ) - strlen( $a );
+		} );
+
+		foreach ( $mapping as $from_url => $to_url ) {
+			// Replace the exact URL.
+			$content = str_replace( $from_url, $to_url, $content );
+
+			// Also handle image resizes: replace the base path (without extension).
+			// e.g., image.jpg -> image-300x200.jpg
+			$from_parts = pathinfo( $from_url );
+			$to_parts = pathinfo( $to_url );
+			if ( isset( $from_parts['dirname'], $from_parts['filename'], $to_parts['dirname'], $to_parts['filename'] ) ) {
+				$from_base = $from_parts['dirname'] . '/' . $from_parts['filename'];
+				$to_base = $to_parts['dirname'] . '/' . $to_parts['filename'];
+				if ( $from_base !== $to_base ) {
+					$content = str_replace( $from_base, $to_base, $content );
+				}
+			}
+		}
+
+		return $content;
+	}
+
+	private function frontload_attachments() {
+		$reader = WXREntityReader::create_for_wordpress_importer( $this->import_file );
+		if ( ! $reader ) {
+			throw new \Exception( 'Failed to create entity reader for frontloading attachments.' );
+		}
+
+		while ( $reader->next_entity() ) {
+			$entity = $reader->get_entity();
+			if ( $entity->get_type() !== 'post' ) {
+				continue;
+			}
+
+			$post = $entity->get_data();
+			if ( $post['post_type'] !== 'attachment' ) {
+				continue;
+			}
+
+			$original_url = isset( $post['attachment_url'] ) ? $post['attachment_url'] : '';
+			$url = ! empty( $original_url ) ? $original_url : $post['guid'];
+
+			// Skip if we've already processed this URL.
+			if ( $this->get_mapped_url( $url ) ) {
+				continue;
+			}
+
+			// if the URL is absolute, but does not contain address, then upload it assuming base_site_url
+			if ( preg_match( '|^/[\w\W]+$|', $url ) ) {
+				$url = rtrim( $this->base_url, '/' ) . $url;
+			}
+
+			// try to use _wp_attached file for upload folder placement to ensure the same location as the export site
+			// e.g. location is 2003/05/image.jpg but the attachment post_date is 2010/09, see media_handle_upload()
+			$post['upload_date'] = $post['post_date'];
+			if ( isset( $post['postmeta'] ) ) {
+				foreach ( $post['postmeta'] as $meta ) {
+					if ( '_wp_attached_file' == $meta['key'] ) {
+						if ( preg_match( '%^[0-9]{4}/[0-9]{2}%', $meta['value'], $matches ) ) {
+							$post['upload_date'] = $matches[0];
+						}
+						break;
+					}
+				}
+			}
+
+			$upload = $this->fetch_remote_file( $url, $post );
+			if ( is_wp_error( $upload ) ) {
+				continue;
+			}
+
+			$info = wp_check_filetype( $upload['file'] );
+			if ( ! $info ) {
+				continue;
+			}
+
+			// Store the URL mapping: original URL -> new uploaded URL.
+			$this->store_url_mapping( $url, $upload['url'] );
+			if ( $original_url && $original_url !== $url ) {
+				$this->store_url_mapping( $original_url, $upload['url'] );
+			}
+
+			$this->save_cursor();
+		}
+	}
+
 	/**
 	 * Processes the import payload one entity at a time using a streaming reader.
 	 *
@@ -188,506 +397,712 @@ class WP_Import extends WP_Importer {
 	 * the execution flow explicit and resume-friendly. This bypasses the legacy
 	 * aggregate filters (`wp_import_tags`, `wp_import_posts`, etc.) because they
 	 * require loading the full dataset into memory.
-	 * 
-	 * TODO:
-	 * 
-	 * Stream handling for those properties:
-	 * 
-	 *	public $processed_authors    = array();
-	 *	public $author_mapping       = array();
-	 *	public $processed_terms      = array();
-	 *	public $processed_posts      = array();
-	 *	public $post_orphans         = array();
-	 *	public $processed_menu_items = array();
-	 *	public $menu_item_orphans    = array();
-	 *	public $missing_menu_items   = array();
-	 *
-	 *	public $fetch_attachments = false;
-	 *	public $url_remap         = array();
-	 *	public $featured_images   = array();
-	 *
-	 * Stream handling for $this->get_author_mapping();
 	 *
 	 * @since 0.9.0
 	 * @return bool True when the streaming loop finished, false on failure.
 	 */
-	public function run_entity_loop( $last_cursor = null ) {
-		if ( null !== $last_cursor ) {
-			$last_cursor = json_decode( $last_cursor, true );
-			if ( false === $last_cursor ) {
-				return false;
-			}
-			$this->version = $last_cursor['version'];
-			$this->base_url = $last_cursor['base_url'];
-
-			$this->processed_authors = $last_cursor['processed_authors'];
-			$this->author_mapping = $last_cursor['author_mapping'];
-			$this->processed_terms = $last_cursor['processed_terms'];
-			$this->processed_posts = $last_cursor['processed_posts'];
-			$this->post_orphans = $last_cursor['post_orphans'];
-			$this->processed_menu_items = $last_cursor['processed_menu_items'];
-			$this->menu_item_orphans = $last_cursor['menu_item_orphans'];
-			$this->missing_menu_items = $last_cursor['missing_menu_items'];
-			$this->fetch_attachments = $last_cursor['fetch_attachments'];
-			$this->options = $last_cursor['options'];
-			$this->import_file = $last_cursor['import_file'];
-			$this->stream_cursor = $last_cursor['stream_cursor'];
-		}
-
-		if ( empty( $this->import_file ) || ! is_readable( $this->import_file ) ) {
-			return false;
-		}
-
-		$reader = WXREntityReader::create_for_wordpress_importer( $this->import_file );
-
+	private $topologically_skipped_before = null;
+	private function run_topological_entity_loop() {
+		$reader = WXREntityReader::create_for_wordpress_importer( $this->import_file, $this->stream_cursor['wxr_cursor'] ?? null );
 		if ( ! $reader ) {
 			return false;
 		}
 
-		$this->stream_cursor = array(
-			'last_entity_type'        => null,
-			'last_post_id'            => null,
-			'last_comment_id'         => null,
-			'last_term_id'            => null,
-			'current_post_id'         => null,
-			'current_comment_post_id' => null,
-			'current_post_exists'     => null,
-			'post_context'            => array(
-				'post'                 => null,
-				'comment_id_map'       => array(),
-				'pending_comment_meta' => array(),
-			),
-			'last_term_context'       => array(),
-			'pending_entities'        => array(),
-		);
-
 		while ( true ) {
-			if ( ! empty( $this->stream_cursor['pending_entities'] ) ) {
-				$internal_entity = array_shift( $this->stream_cursor['pending_entities'] );
-				$entity_type     = $internal_entity['type'];
-				$data            = $internal_entity['data'];
-			} else {
-				if ( ! $reader->next_entity() ) {
+			if ( $this->first_full_run_done ) {
+				$this->topologically_skipped_before = $this->count_skipped_entities();
+			}
+			while ( false !== $this->stream_topological_import_next_entity( $reader ) ) {
+				// twiddle our thumbs...
+			}
+			$this->first_full_run_done = true;
+			$this->save_cursor();
+
+			$skipped_after = $this->count_skipped_entities();
+			var_dump([
+				'skipped_after' => $skipped_after,
+				'topologically_skipped_before' => $this->topologically_skipped_before,
+			]);
+			var_dump($this->topologically_skipped_ranges);
+			if ( $skipped_after === $this->topologically_skipped_before || $skipped_after === 0 ) {
+				// The latest run did not process any more entities. The next
+				// run will not process any more entities either. We're done.
+				break;
+			}
+
+			$reader = WXREntityReader::create_for_wordpress_importer( $this->import_file );
+			if ( ! $reader ) {
+				return false;
+			}
+			$this->initialize_empty_stream_cursor();
+		}
+
+		return true;
+	}
+
+	private function stream_topological_import_next_entity( $reader ) {
+		if ( ! empty( $this->stream_cursor['pending_entities'] ) ) {
+			$internal_entity = array_shift( $this->stream_cursor['pending_entities'] );
+			$entity_type     = $internal_entity['type'];
+			$data            = $internal_entity['data'];
+		} else {
+			if ( ! $reader->next_entity() ) {
+				$this->finalize_stream_post_context();
+				$this->first_full_run_done = true;
+				$this->save_cursor();
+				return false;
+			}
+			$this->stream_cursor['wxr_cursor'] = $reader->get_reentrancy_cursor();
+			++$this->stream_cursor['last_entity_index'];
+
+			/**
+			 * Once we've processed the full data set for the first time, we only
+			 * want to continue processing entities that were topologically skipped
+			 * before.
+			 */
+			if ( $this->first_full_run_done ) {
+				if( $this->is_topologically_skipped( $this->stream_cursor['last_entity_index'] )) {
+					$metadata = $this->topologically_unskip_entity();
+					if ( isset( $metadata['current_post_id'] ) ) {
+						$this->stream_cursor['current_post_id'] = $metadata['current_post_id'];
+					}
+					if ( isset( $metadata['current_comment_post_id'] ) ) {
+						$this->stream_cursor['current_comment_post_id'] = $metadata['current_comment_post_id'];
+					}
+					if ( isset( $metadata['current_post_exists'] ) ) {
+						$this->stream_cursor['current_post_exists'] = $metadata['current_post_exists'];
+					}
+				} else {
+					return null;
+				}
+			}
+
+			$entity = $reader->get_entity();
+			if ( ! $entity instanceof ImportEntity ) {
+				// TODO: Handle error. Why would get_entity() return anything else, though?
+				$this->finalize_stream_post_context();
+				var_dump(' ENTITY NOT INSTANCE OF ImportEntity, returning null');
+				return;
+			}
+
+			$data                                    = $entity->get_data();
+			$entity_type                             = $entity->get_type();
+			$this->stream_cursor['last_entity_type'] = $entity_type;
+		}
+
+		switch ( $entity_type ) {
+			case 'site_option':
+				if ( empty( $data['option_name'] ) ) {
 					break;
 				}
 
-				$entity = $reader->get_entity();
-
-				if ( ! $entity instanceof ImportEntity ) {
-					continue;
-				}
-
-				$data                                    = $entity->get_data();
-				$entity_type                             = $entity->get_type();
-				$this->stream_cursor['last_entity_type'] = $entity_type;
-			}
-
-			if ( $this->defer_entity_until_term_meta_applied( $entity_type, $data ) ) {
-				continue;
-			}
-			switch ( $entity_type ) {
-				case 'site_option':
-					if ( empty( $data['option_name'] ) ) {
+				switch ( $data['option_name'] ) {
+					case 'wxr_version':
+						$this->version = $data['option_value'];
 						break;
-					}
-
-					switch ( $data['option_name'] ) {
-						case 'wxr_version':
-							$this->version = $data['option_value'];
-							break;
-						case 'siteurl':
+					case 'siteurl':
+						$this->base_url               = esc_url( $data['option_value'] );
+						$base_url_with_trailing_slash = rtrim( $this->base_url, '/' ) . '/';
+						$this->base_url_parsed        = WPURL::parse( $base_url_with_trailing_slash );
+						break;
+					case 'home':
+						if ( empty( $this->base_url ) ) {
 							$this->base_url               = esc_url( $data['option_value'] );
 							$base_url_with_trailing_slash = rtrim( $this->base_url, '/' ) . '/';
 							$this->base_url_parsed        = WPURL::parse( $base_url_with_trailing_slash );
-							break;
-						case 'home':
-							if ( empty( $this->base_url ) ) {
-								$this->base_url               = esc_url( $data['option_value'] );
-								$base_url_with_trailing_slash = rtrim( $this->base_url, '/' ) . '/';
-								$this->base_url_parsed        = WPURL::parse( $base_url_with_trailing_slash );
-							}
-							break;
-					}
+						}
+						break;
+				}
 
-					if ( ! $this->site_url_parsed ) {
-						$site_url_with_trailing_slash = rtrim( get_site_url(), '/' ) . '/';
-						$this->site_url_parsed        = WPURL::parse( $site_url_with_trailing_slash );
-					}
+				if ( ! $this->site_url_parsed ) {
+					$site_url_with_trailing_slash = rtrim( get_site_url(), '/' ) . '/';
+					$this->site_url_parsed        = WPURL::parse( $site_url_with_trailing_slash );
+				}
+				break;
+
+			case 'user':
+				if ( empty( $data['user_login'] ) ) {
 					break;
+				}
 
-				case 'user':
-					if ( empty( $data['user_login'] ) ) {
-						break;
-					}
+				$login = sanitize_user( $data['user_login'], true );
 
-					$login = sanitize_user( $data['user_login'], true );
+				$this->authors[ $login ] = array(
+					'author_id'           => isset( $data['author_id'] ) ? $data['author_id'] : null,
+					'author_login'        => $login,
+					'author_email'        => isset( $data['author_email'] ) ? $data['author_email'] : '',
+					'author_display_name' => isset( $data['author_display_name'] ) ? $data['author_display_name'] : $login,
+					'author_first_name'   => isset( $data['author_first_name'] ) ? $data['author_first_name'] : '',
+					'author_last_name'    => isset( $data['author_last_name'] ) ? $data['author_last_name'] : '',
+				);
+				break;
 
-					$this->authors[ $login ] = array(
-						'author_id'           => isset( $data['author_id'] ) ? $data['author_id'] : null,
-						'author_login'        => $login,
-						'author_email'        => isset( $data['author_email'] ) ? $data['author_email'] : '',
-						'author_display_name' => isset( $data['author_display_name'] ) ? $data['author_display_name'] : $login,
-						'author_first_name'   => isset( $data['author_first_name'] ) ? $data['author_first_name'] : '',
-						'author_last_name'    => isset( $data['author_last_name'] ) ? $data['author_last_name'] : '',
-					);
+			case 'category':
+				/**
+				 * Topological dependencies for categories are different than for posts.
+				 * Posts use a numeric post_parent ID. Categories use a string category_parent ID:
+				 * 
+				 * <wp:category>
+				 * 	<wp:term_id>30849</wp:term_id>
+				 * 	<wp:category_nicename>sub</wp:category_nicename>
+				 * 	<wp:category_parent>aciform</wp:category_parent>
+				 * 	<wp:cat_name><![CDATA[sub]]></wp:cat_name>
+				 * </wp:category>
+				 * 
+				 * The legacy buffering WP_Import class seemed to assume the categories are
+				 * already sorted topologically. If a parent would not exist at the time of creation,
+				 * the created category would be orphaned without any postprocessing. Furthermore,
+				 * posts relying a category were assumed to be listed after their dependent category.
+				 * 
+				 * Therefore, in the current iteration, there is no topological processing of categories.
+				 * It will be a nice future step-up, but not implementing it does not break any existing
+				 * functionality.
+				 */
+				$category = array(
+					'category_nicename'    => isset( $data['category_nicename'] ) ? $data['category_nicename'] : ( isset( $data['slug'] ) ? $data['slug'] : '' ),
+					'category_parent'      => isset( $data['category_parent'] ) ? $data['category_parent'] : ( isset( $data['parent'] ) ? $data['parent'] : '' ),
+					'cat_name'             => isset( $data['cat_name'] ) ? $data['cat_name'] : ( isset( $data['name'] ) ? $data['name'] : '' ),
+					'category_description' => isset( $data['category_description'] ) ? $data['category_description'] : ( isset( $data['description'] ) ? $data['description'] : '' ),
+				);
+
+				if ( isset( $data['term_id'] ) ) {
+					$category['term_id'] = $data['term_id'];
+				}
+
+				$processed_category = $this->process_category( $category );
+
+				if ( false === $processed_category ) {
+					$this->stream_cursor['last_term_context'] = array();
 					break;
+				}
 
-				case 'category':
-					$category = array(
-						'category_nicename'    => isset( $data['category_nicename'] ) ? $data['category_nicename'] : ( isset( $data['slug'] ) ? $data['slug'] : '' ),
-						'category_parent'      => isset( $data['category_parent'] ) ? $data['category_parent'] : ( isset( $data['parent'] ) ? $data['parent'] : '' ),
-						'cat_name'             => isset( $data['cat_name'] ) ? $data['cat_name'] : ( isset( $data['name'] ) ? $data['name'] : '' ),
-						'category_description' => isset( $data['category_description'] ) ? $data['category_description'] : ( isset( $data['description'] ) ? $data['description'] : '' ),
-					);
+				if ( isset( $category['term_id'] ) ) {
+					$this->processed_terms[ intval( $category['term_id'] ) ] = $processed_category['term_id'];
+				}
 
-					if ( isset( $data['term_id'] ) ) {
-						$category['term_id'] = $data['term_id'];
-					}
+				$this->stream_cursor['last_term_context'] = array(
+					'term'      => $category,
+					'processed' => $processed_category,
+					'termmeta'  => array(),
+				);
+				$this->stream_cursor['last_term_id']      = $processed_category['term_id'];
+				break;
 
-					$processed_category = $this->process_category( $category );
+			case 'tag':
+				/**
+				 * See "categories" above for the explanation of topological dependencies for tags.
+				 */
+				$tag = array(
+					'tag_slug'        => isset( $data['tag_slug'] ) ? $data['tag_slug'] : ( isset( $data['slug'] ) ? $data['slug'] : '' ),
+					'tag_name'        => isset( $data['tag_name'] ) ? $data['tag_name'] : ( isset( $data['name'] ) ? $data['name'] : '' ),
+					'tag_description' => isset( $data['tag_description'] ) ? $data['tag_description'] : ( isset( $data['description'] ) ? $data['description'] : '' ),
+				);
 
-					if ( false === $processed_category ) {
-						$this->stream_cursor['last_term_context'] = array();
-						break;
-					}
+				if ( isset( $data['term_id'] ) ) {
+					$tag['term_id'] = $data['term_id'];
+				}
 
-					if ( isset( $category['term_id'] ) ) {
-						$this->processed_terms[ intval( $category['term_id'] ) ] = $processed_category['term_id'];
-					}
+				$processed_tag = $this->process_tag( $tag );
 
-					$this->stream_cursor['last_term_context'] = array(
-						'term'      => $category,
-						'processed' => $processed_category,
-						'termmeta'  => array(),
-					);
-					$this->stream_cursor['last_term_id']      = $processed_category['term_id'];
+				if ( false === $processed_tag ) {
+					$this->stream_cursor['last_term_context'] = array();
 					break;
+				}
 
-				case 'tag':
-					$tag = array(
-						'tag_slug'        => isset( $data['tag_slug'] ) ? $data['tag_slug'] : ( isset( $data['slug'] ) ? $data['slug'] : '' ),
-						'tag_name'        => isset( $data['tag_name'] ) ? $data['tag_name'] : ( isset( $data['name'] ) ? $data['name'] : '' ),
-						'tag_description' => isset( $data['tag_description'] ) ? $data['tag_description'] : ( isset( $data['description'] ) ? $data['description'] : '' ),
-					);
+				if ( isset( $tag['term_id'] ) ) {
+					$this->processed_terms[ intval( $tag['term_id'] ) ] = $processed_tag['term_id'];
+				}
 
-					if ( isset( $data['term_id'] ) ) {
-						$tag['term_id'] = $data['term_id'];
-					}
+				$this->stream_cursor['last_term_context'] = array(
+					'term'      => $tag,
+					'processed' => $processed_tag,
+					'termmeta'  => array(),
+				);
+				$this->stream_cursor['last_term_id']      = $processed_tag['term_id'];
+				break;
 
-					$processed_tag = $this->process_tag( $tag );
+			case 'term':
+				/**
+				 * See "categories" above for the explanation of topological dependencies for terms.
+				 */
+				$term = array(
+					'term_id'          => isset( $data['term_id'] ) ? $data['term_id'] : ( isset( $data['ID'] ) ? $data['ID'] : 0 ),
+					'term_taxonomy'    => isset( $data['term_taxonomy'] ) ? $data['term_taxonomy'] : ( isset( $data['taxonomy'] ) ? $data['taxonomy'] : '' ),
+					'term_slug'        => isset( $data['term_slug'] ) ? $data['term_slug'] : ( isset( $data['slug'] ) ? $data['slug'] : '' ),
+					'term_parent'      => isset( $data['term_parent'] ) ? $data['term_parent'] : ( isset( $data['parent'] ) ? $data['parent'] : '' ),
+					'term_name'        => isset( $data['term_name'] ) ? $data['term_name'] : ( isset( $data['name'] ) ? $data['name'] : '' ),
+					'term_description' => isset( $data['term_description'] ) ? $data['term_description'] : ( isset( $data['description'] ) ? $data['description'] : '' ),
+				);
 
-					if ( false === $processed_tag ) {
-						$this->stream_cursor['last_term_context'] = array();
-						break;
-					}
+				$processed_term = $this->process_term( $term );
 
-					if ( isset( $tag['term_id'] ) ) {
-						$this->processed_terms[ intval( $tag['term_id'] ) ] = $processed_tag['term_id'];
-					}
-
-					$this->stream_cursor['last_term_context'] = array(
-						'term'      => $tag,
-						'processed' => $processed_tag,
-						'termmeta'  => array(),
-					);
-					$this->stream_cursor['last_term_id']      = $processed_tag['term_id'];
+				if ( false === $processed_term ) {
+					$this->stream_cursor['last_term_context'] = array();
 					break;
+				}
 
-				case 'term':
-					$term = array(
-						'term_id'          => isset( $data['term_id'] ) ? $data['term_id'] : ( isset( $data['ID'] ) ? $data['ID'] : 0 ),
-						'term_taxonomy'    => isset( $data['term_taxonomy'] ) ? $data['term_taxonomy'] : ( isset( $data['taxonomy'] ) ? $data['taxonomy'] : '' ),
-						'term_slug'        => isset( $data['term_slug'] ) ? $data['term_slug'] : ( isset( $data['slug'] ) ? $data['slug'] : '' ),
-						'term_parent'      => isset( $data['term_parent'] ) ? $data['term_parent'] : ( isset( $data['parent'] ) ? $data['parent'] : '' ),
-						'term_name'        => isset( $data['term_name'] ) ? $data['term_name'] : ( isset( $data['name'] ) ? $data['name'] : '' ),
-						'term_description' => isset( $data['term_description'] ) ? $data['term_description'] : ( isset( $data['description'] ) ? $data['description'] : '' ),
-					);
+				if ( isset( $term['term_id'] ) ) {
+					$this->processed_terms[ intval( $term['term_id'] ) ] = $processed_term['term_id'];
+				}
 
-					$processed_term = $this->process_term( $term );
+				$this->stream_cursor['last_term_context'] = array(
+					'term'      => $term,
+					'processed' => $processed_term,
+					'termmeta'  => array(),
+				);
+				$this->stream_cursor['last_term_id']      = $processed_term['term_id'];
+				break;
 
-					if ( false === $processed_term ) {
-						$this->stream_cursor['last_term_context'] = array();
-						break;
-					}
-
-					if ( isset( $term['term_id'] ) ) {
-						$this->processed_terms[ intval( $term['term_id'] ) ] = $processed_term['term_id'];
-					}
-
-					$this->stream_cursor['last_term_context'] = array(
-						'term'      => $term,
-						'processed' => $processed_term,
-						'termmeta'  => array(),
-					);
-					$this->stream_cursor['last_term_id']      = $processed_term['term_id'];
+			case 'term_meta':
+				if ( empty( $this->stream_cursor['last_term_context'] ) ) {
 					break;
+				}
 
-				case 'term_meta':
-					if ( empty( $this->stream_cursor['last_term_context'] ) ) {
-						break;
-					}
+				$key = isset( $data['key'] ) ? $data['key'] : ( isset( $data['meta_key'] ) ? $data['meta_key'] : null );
+				if ( ! $key ) {
+					break;
+				}
 
-					$key = isset( $data['key'] ) ? $data['key'] : ( isset( $data['meta_key'] ) ? $data['meta_key'] : null );
-					if ( ! $key ) {
-						break;
-					}
-
-					$this->stream_cursor['last_term_context']['termmeta'][] = array(
+				$this->process_termmeta(
+					$this->stream_cursor['last_term_id'], array(
 						'key'   => $key,
 						'value' => isset( $data['value'] ) ? $data['value'] : ( isset( $data['meta_value'] ) ? $data['meta_value'] : '' ),
-					);
-					break;
+					),
+					$this->stream_cursor['last_term_context']['term']
+				);
+				break;
 
-				case 'post':
-					$this->finalize_stream_post_context();
+			case 'post':
+				$this->finalize_stream_post_context();
 
-					$post_data = $data;
-					if ( isset( $post_data['post_status'] ) && ! isset( $post_data['status'] ) ) {
-						$post_data['status'] = $post_data['post_status'];
+				$post_data = $data;
+				if ( isset( $post_data['post_status'] ) && ! isset( $post_data['status'] ) ) {
+					$post_data['status'] = $post_data['post_status'];
+				}
+
+				$defaults = array(
+					'post_title'     => '',
+					'post_content'   => '',
+					'post_excerpt'   => '',
+					'post_author'    => '',
+					'post_date'      => '',
+					'post_date_gmt'  => '',
+					'comment_status' => 'open',
+					'ping_status'    => 'open',
+					'post_name'      => '',
+					'post_status'    => '',
+					'status'         => '',
+					'post_parent'    => 0,
+					'menu_order'     => 0,
+					'post_type'      => 'post',
+					'post_password'  => '',
+					'post_id'        => 0,
+					'is_sticky'      => 0,
+					'guid'           => isset( $post_data['guid'] ) ? $post_data['guid'] : ( isset( $post_data['link'] ) ? $post_data['link'] : '' ),
+				);
+
+				$post = array_merge( $defaults, $post_data );
+				$post_parent = isset( $post['post_parent'] ) ? (int) $post['post_parent'] : 0;
+				if ( $post_parent > 0 ) {
+					if ( ! isset( $this->processed_posts[ $post_parent ] ) ) {
+						$this->topological_skip_entity();
+						return;
 					}
+					// Imported parent ID => new parent ID translation is handled in the process_post()
+					// method, so we don't need to do anything else here.
+				}
 
-					$defaults = array(
-						'post_title'     => '',
-						'post_content'   => '',
-						'post_excerpt'   => '',
-						'post_author'    => '',
-						'post_date'      => '',
-						'post_date_gmt'  => '',
-						'comment_status' => 'open',
-						'ping_status'    => 'open',
-						'post_name'      => '',
-						'post_status'    => '',
-						'status'         => '',
-						'post_parent'    => 0,
-						'menu_order'     => 0,
-						'post_type'      => 'post',
-						'post_password'  => '',
-						'post_id'        => 0,
-						'is_sticky'      => 0,
-						'guid'           => isset( $post_data['guid'] ) ? $post_data['guid'] : ( isset( $post_data['link'] ) ? $post_data['link'] : '' ),
-					);
+				if ( empty( $post['status'] ) ) {
+					$post['status'] = $post['post_status'];
+				}
 
-					$post = array_merge( $defaults, $post_data );
-					if ( empty( $post['status'] ) ) {
-						$post['status'] = $post['post_status'];
-					}
-
-					if ( isset( $post['terms'] ) && is_array( $post['terms'] ) ) {
-						foreach ( $post['terms'] as $index => $term ) {
-							if ( isset( $term['domain'] ) ) {
-								continue;
-							}
-
-							if ( isset( $term['taxonomy'] ) ) {
-								$post['terms'][ $index ] = array(
-									'domain' => $term['taxonomy'],
-									'slug'   => isset( $term['slug'] ) ? $term['slug'] : '',
-									'name'   => isset( $term['description'] ) ? $term['description'] : '',
-								);
-							}
-						}
-					}
-
-					$post = apply_filters( 'wp_import_post_data_raw', $post );
-
-					if ( ! post_type_exists( $post['post_type'] ) ) {
-						printf(
-							__( 'Failed to import &#8220;%1$s&#8221;: Invalid post type %2$s', 'wordpress-importer' ),
-							esc_html( $post['post_title'] ),
-							esc_html( $post['post_type'] )
-						);
-						echo '<br />';
-						do_action( 'wp_import_post_exists', $post );
-						break;
-					}
-
-					if ( isset( $this->processed_posts[ $post['post_id'] ] ) && ! empty( $post['post_id'] ) ) {
-						break;
-					}
-
-					if ( 'auto-draft' === $post['status'] ) {
-						break;
-					}
-
-					if ( 'nav_menu_item' === $post['post_type'] ) {
-						$this->process_menu_item( $post );
-						break;
-					}
-
-					$post_type_object = get_post_type_object( $post['post_type'] );
-					if ( ! $post_type_object ) {
-						break;
-					}
-
-					$processed_post = $this->process_post( $post, $post_type_object );
-					if ( ! $processed_post ) {
-						break;
-					}
-
-					$post_id         = $processed_post['post_id'];
-					$comment_post_id = $processed_post['comment_post_id'];
-					$post_exists     = (bool) $processed_post['post_exists'];
-
-					$terms = isset( $post['terms'] ) ? $post['terms'] : array();
-					$terms = apply_filters( 'wp_import_post_terms', $terms, $post_id, $post );
-
-					if ( ! empty( $terms ) ) {
-						$this->process_post_terms( $terms, $post_id, $post );
-					}
-
-					$this->stream_cursor['post_context'] = array(
-						'post'                 => $post,
-						'comment_id_map'       => array(),
-						'pending_comment_meta' => array(),
-					);
-
-					$this->stream_cursor['last_post_id']            = $post_id;
-					$this->stream_cursor['current_post_id']         = $post_id;
-					$this->stream_cursor['current_comment_post_id'] = $comment_post_id;
-					$this->stream_cursor['current_post_exists']     = $post_exists;
-					break;
-
-				case 'post_meta':
-					if ( empty( $this->stream_cursor['current_post_id'] ) ) {
-						break;
-					}
-
-					$key = isset( $data['key'] ) ? $data['key'] : ( isset( $data['meta_key'] ) ? $data['meta_key'] : null );
-					if ( ! $key ) {
-						break;
-					}
-
-					$meta = array(
-						'key'   => $key,
-						'value' => isset( $data['value'] ) ? $data['value'] : ( isset( $data['meta_value'] ) ? $data['meta_value'] : '' ),
-					);
-
-					$this->process_post_meta( $meta, $this->stream_cursor['current_post_id'] );
-					break;
-
-				case 'comment':
-					if ( empty( $this->stream_cursor['current_post_id'] ) ) {
-						break;
-					}
-
-					$original_comment_id = isset( $data['comment_id'] ) ? intval( $data['comment_id'] ) : null;
-					$comment_parent      = isset( $data['comment_parent'] ) ? (int) $data['comment_parent'] : 0;
-					$comment             = array(
-						'comment_post_ID'      => $this->stream_cursor['current_comment_post_id'],
-						'comment_author'       => isset( $data['comment_author'] ) ? $data['comment_author'] : '',
-						'comment_author_email' => isset( $data['comment_author_email'] ) ? $data['comment_author_email'] : '',
-						'comment_author_url'   => isset( $data['comment_author_url'] ) ? $data['comment_author_url'] : '',
-						'comment_author_IP'    => isset( $data['comment_author_IP'] ) ? $data['comment_author_IP'] : '',
-						'comment_date'         => isset( $data['comment_date'] ) ? $data['comment_date'] : '',
-						'comment_date_gmt'     => isset( $data['comment_date_gmt'] ) ? $data['comment_date_gmt'] : '',
-						'comment_content'      => isset( $data['comment_content'] ) ? $data['comment_content'] : '',
-						'comment_approved'     => isset( $data['comment_approved'] ) ? $data['comment_approved'] : 1,
-						'comment_type'         => isset( $data['comment_type'] ) ? $data['comment_type'] : '',
-						'comment_parent'       => $comment_parent,
-						'commentmeta'          => array(),
-					);
-
-					if ( isset( $data['comment_user_id'] ) && isset( $this->processed_authors[ $data['comment_user_id'] ] ) ) {
-						$comment['user_id'] = $this->processed_authors[ $data['comment_user_id'] ];
-					}
-
-					if ( $comment_parent && isset( $this->stream_cursor['post_context']['comment_id_map'][ $comment_parent ] ) ) {
-						$comment['comment_parent'] = $this->stream_cursor['post_context']['comment_id_map'][ $comment_parent ];
-					} else {
-						$comment['comment_parent'] = (int) $comment_parent;
-					}
-
-					$inserted_comment_id = $this->process_post_comment(
-						$comment,
-						(bool) $this->stream_cursor['current_post_exists'],
-						$this->stream_cursor['current_comment_post_id']
-					);
-
-					if ( $inserted_comment_id ) {
-						$this->stream_cursor['last_comment_id'] = $inserted_comment_id;
-						if ( null !== $original_comment_id ) {
-							$this->stream_cursor['post_context']['comment_id_map'][ $original_comment_id ] = $inserted_comment_id;
+				if ( isset( $post['terms'] ) && is_array( $post['terms'] ) ) {
+					foreach ( $post['terms'] as $index => $term ) {
+						if ( isset( $term['domain'] ) ) {
+							continue;
 						}
 
-						$this->enqueue_comment_meta( $original_comment_id, $inserted_comment_id );
+						if ( isset( $term['taxonomy'] ) ) {
+							$post['terms'][ $index ] = array(
+								'domain' => $term['taxonomy'],
+								'slug'   => isset( $term['slug'] ) ? $term['slug'] : '',
+								'name'   => isset( $term['description'] ) ? $term['description'] : '',
+							);
+						}
 					}
+				}
+
+				$post = apply_filters( 'wp_import_post_data_raw', $post );
+
+				if ( ! post_type_exists( $post['post_type'] ) ) {
+					printf(
+						__( 'Failed to import &#8220;%1$s&#8221;: Invalid post type %2$s', 'wordpress-importer' ),
+						esc_html( $post['post_title'] ),
+						esc_html( $post['post_type'] )
+					);
+					echo '<br />';
+					do_action( 'wp_import_post_exists', $post );
 					break;
+				}
 
-				case 'comment_meta':
-					if ( empty( $this->stream_cursor['current_post_id'] ) ) {
-						break;
+				if ( isset( $this->processed_posts[ $post['post_id'] ] ) && ! empty( $post['post_id'] ) ) {
+					break;
+				}
+
+				if ( 'auto-draft' === $post['status'] ) {
+					break;
+				}
+
+				if ( 'nav_menu_item' === $post['post_type'] ) {
+					$this->process_menu_item( $post );
+					break;
+				}
+
+				$post_type_object = get_post_type_object( $post['post_type'] );
+				if ( ! $post_type_object ) {
+					break;
+				}
+
+				$processed_post = $this->process_post( $post, $post_type_object );
+				if ( ! $processed_post ) {
+					break;
+				}
+
+				$post_id         = $processed_post['post_id'];
+				$comment_post_id = $processed_post['comment_post_id'];
+				$post_exists     = (bool) $processed_post['post_exists'];
+
+				$terms = isset( $post['terms'] ) ? $post['terms'] : array();
+				$terms = apply_filters( 'wp_import_post_terms', $terms, $post_id, $post );
+
+				if ( ! empty( $terms ) ) {
+					$this->process_post_terms( $terms, $post_id, $post );
+				}
+
+				$this->stream_cursor['post_context'] = array(
+					'post'                 => $post,
+					'comment_id_map'       => array(),
+					'pending_comment_meta' => array(),
+				);
+
+				$this->stream_cursor['last_post_id']            = $post_id;
+				$this->stream_cursor['current_post_id']         = $post_id;
+				$this->stream_cursor['current_comment_post_id'] = $comment_post_id;
+				$this->stream_cursor['current_post_exists']     = $post_exists;
+				break;
+
+			case 'post_meta':
+				if ( empty( $this->stream_cursor['current_post_id'] ) ) {
+					// TODO: Log something – we just saw a post meta outside of a post context. The
+					//       only thing we can do is skip it.
+					break;
+				}
+
+				// No need to use post mapping – meta entries in WXR do not have an associated post ID.
+				// They are just defined as children of the `<item>` element.
+
+				$key = isset( $data['key'] ) ? $data['key'] : ( isset( $data['meta_key'] ) ? $data['meta_key'] : null );
+				if ( ! $key ) {
+					break;
+				}
+
+				$meta = array(
+					'key'   => $key,
+					'value' => isset( $data['value'] ) ? $data['value'] : ( isset( $data['meta_value'] ) ? $data['meta_value'] : '' ),
+				);
+
+				$this->process_post_meta( $meta, $this->stream_cursor['current_post_id'] );
+				break;
+
+			case 'comment':
+				if ( empty( $this->stream_cursor['current_post_id'] ) ) {
+					var_dump(' skipping comment: no current post id ');
+					break;
+				}
+
+				$original_comment_id = isset( $data['comment_id'] ) ? intval( $data['comment_id'] ) : null;
+				$comment_parent      = isset( $data['comment_parent'] ) ? (int) $data['comment_parent'] : 0;
+				if ( $comment_parent > 0 && ! isset( $this->processed_comments[ $comment_parent ] ) ) {
+					var_dump(' topologically skipping comment: ' . $original_comment_id . ' (parent: ' . $comment_parent . ')');
+					var_dump(['processed_comments' => $this->processed_comments]);
+					$this->topological_skip_entity( array(
+						'current_post_id'         => $this->stream_cursor['current_post_id'],
+						'current_comment_post_id' => $this->stream_cursor['current_comment_post_id'],
+						'current_post_exists'     => $this->stream_cursor['current_post_exists'],
+					) );
+					// Make sure the following meta won't be associated with this comment
+					$this->stream_cursor['last_comment_id'] = null;
+					return;
+				}
+
+				$comment             = array(
+					'comment_post_ID'      => $this->stream_cursor['current_comment_post_id'],
+					'comment_author'       => isset( $data['comment_author'] ) ? $data['comment_author'] : '',
+					'comment_author_email' => isset( $data['comment_author_email'] ) ? $data['comment_author_email'] : '',
+					'comment_author_url'   => isset( $data['comment_author_url'] ) ? $data['comment_author_url'] : '',
+					'comment_author_IP'    => isset( $data['comment_author_IP'] ) ? $data['comment_author_IP'] : '',
+					'comment_date'         => isset( $data['comment_date'] ) ? $data['comment_date'] : '',
+					'comment_date_gmt'     => isset( $data['comment_date_gmt'] ) ? $data['comment_date_gmt'] : '',
+					'comment_content'      => isset( $data['comment_content'] ) ? $data['comment_content'] : '',
+					'comment_approved'     => isset( $data['comment_approved'] ) ? $data['comment_approved'] : 1,
+					'comment_type'         => isset( $data['comment_type'] ) ? $data['comment_type'] : '',
+					'comment_parent'       => $comment_parent > 0 ? $this->processed_comments[ $comment_parent ] : $comment_parent,
+					'commentmeta'          => array(),
+				);
+				var_dump(' processing comment: ' . $original_comment_id . ' (parent: ' . $comment_parent . ')');
+
+				if ( isset( $data['comment_user_id'] ) && isset( $this->processed_authors[ $data['comment_user_id'] ] ) ) {
+					$comment['user_id'] = $this->processed_authors[ $data['comment_user_id'] ];
+				}
+
+				$inserted_comment_id = $this->process_post_comment(
+					$comment,
+					(bool) $this->stream_cursor['current_post_exists'],
+					$this->stream_cursor['current_comment_post_id']
+				);
+
+				if ( $inserted_comment_id ) {
+					$this->stream_cursor['last_comment_id'] = $inserted_comment_id;
+					// @TODO: Replace an array-based comment ID map with a storage format that
+					//        would support 10 million comments without going out of memory.
+					//        E.g. a separate table, an SQLite database, a filesystem-based trie, etc.
+					$this->processed_comments[ $original_comment_id ] = $inserted_comment_id;
+
+					// The current comment entity may carry some meta entries – let's defer processing
+					// them to the future passes of this loop:
+					if ( empty( $this->stream_cursor['post_context']['pending_comment_meta'][ $original_comment_id ] ) ) {
+						$this->stream_cursor['post_context']['pending_comment_meta'][ $original_comment_id ] = [];
 					}
-
-					$original_comment_id = isset( $data['comment_id'] ) ? intval( $data['comment_id'] ) : null;
-					$key                 = isset( $data['key'] ) ? $data['key'] : ( isset( $data['meta_key'] ) ? $data['meta_key'] : null );
-					if ( null === $original_comment_id || ! $key ) {
-						break;
-					}
-
-					if ( isset( $this->stream_cursor['post_context']['comment_id_map'][ $original_comment_id ] ) ) {
+			
+					foreach ( $this->stream_cursor['post_context']['pending_comment_meta'][ $original_comment_id ] as $meta ) {
 						$this->stream_cursor['pending_entities'][] = array(
-							'type' => 'enqueued_comment_meta',
+							'type' => 'comment_meta',
 							'data' => array(
-								'comment_id' => $this->stream_cursor['post_context']['comment_id_map'][ $original_comment_id ],
-								'meta'       => array(
-									'key'   => $key,
-									'value' => isset( $data['value'] ) ? $data['value'] : ( isset( $data['meta_value'] ) ? $data['meta_value'] : '' ),
-								),
+								'comment_id' => $inserted_comment_id,
+								'meta'       => $meta,
 							),
 						);
-						break;
 					}
+			
+					unset( $this->stream_cursor['post_context']['pending_comment_meta'][ $original_comment_id ] );
+				}
+				break;
 
-					if ( ! isset( $this->stream_cursor['post_context']['pending_comment_meta'][ $original_comment_id ] ) ) {
-						$this->stream_cursor['post_context']['pending_comment_meta'][ $original_comment_id ] = array();
-					}
-
-					$this->stream_cursor['post_context']['pending_comment_meta'][ $original_comment_id ][] = array(
-						'key'   => $key,
-						'value' => isset( $data['value'] ) ? $data['value'] : ( isset( $data['meta_value'] ) ? $data['meta_value'] : '' ),
-					);
+			case 'comment_meta':
+				if ( empty( $this->stream_cursor['current_post_id'] ) ) {
+					// TODO: Log something – we just saw a post meta outside of a post context. The
+					//       only thing we can do is skip it.
 					break;
+				}
 
-				case 'enqueued_comment_meta':
-					$applied_comment_id = isset( $data['comment_id'] ) ? (int) $data['comment_id'] : 0;
-					$meta               = isset( $data['meta'] ) && is_array( $data['meta'] ) ? $data['meta'] : null;
-					if ( $applied_comment_id && $meta && isset( $meta['key'] ) ) {
-						$this->process_post_comment_meta( $applied_comment_id, $meta );
-					}
+				// No need to use comment mapping – meta entries in WXR do not have an associated comment ID.
+				// They are just defined as children of the `<wp:comment>` element.
+				$applied_comment_id = isset( $data['comment_id'] ) ? (int) $data['comment_id'] : 0;
+				$meta               = isset( $data['meta'] ) && is_array( $data['meta'] ) ? $data['meta'] : null;
+				if ( $applied_comment_id && $meta && isset( $meta['key'] ) ) {
+					$this->process_post_comment_meta( $applied_comment_id, $meta );
+				}
+				break;
+
+			default:
+				if ( 'wxr_version' === $entity->get_type() && isset( $data['wxr_version'] ) ) {
+					$this->version = $data['wxr_version'];
 					break;
-
-				default:
-					if ( 'wxr_version' === $entity->get_type() && isset( $data['wxr_version'] ) ) {
-						$this->version = $data['wxr_version'];
-					}
-					break;
-			}
-
-			// Save the cursor state to the database
-			update_option( 'wp_import_cursor', json_encode( array(
-				'id' => $this->stream_cursor,
-				'version' => $this->version,
-				'base_url' => $this->base_url,
-
-				'processed_authors' => $this->processed_authors,
-				'author_mapping' => $this->author_mapping,
-				'processed_terms' => $this->processed_terms,
-				'processed_posts' => $this->processed_posts,
-				'post_orphans' => $this->post_orphans,
-				'processed_menu_items' => $this->processed_menu_items,
-				'menu_item_orphans' => $this->menu_item_orphans,
-				'missing_menu_items' => $this->missing_menu_items,
-				'fetch_attachments' => $this->fetch_attachments,
-				'options' => $this->fetch_attachments,
-				'import_file' => $this->fetch_attachments,
-				'stream_cursor' => $this->stream_cursor,
-			) ) );
+				}
+				// TODO: Unrecognized entity type. Handle this error somehow.
+				break;
 		}
 
-		$this->finalize_stream_post_context();
-		$this->finalize_stream_term_meta();
-
 		return true;
+	}
+
+	private function is_topologically_skipped( $entity_index ) {
+		foreach ( $this->topologically_skipped_ranges as $range ) {
+			if ( $entity_index >= $range['start'] && $entity_index <= $range['end'] ) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private function topological_skip_entity( $metadata = array() ) {
+		$entity_index = $this->stream_cursor['last_entity_index'];
+		if ( ! count( $this->topologically_skipped_ranges ) ) {
+			$this->topologically_skipped_ranges[] = array(
+				'start'    => $entity_index,
+				'end'      => $entity_index,
+				'metadata' => $metadata,
+			);
+			return;
+		}
+
+		$last_index = count( $this->topologically_skipped_ranges ) - 1;
+		$last_range = $this->topologically_skipped_ranges[ $last_index ];
+
+		// Only extend the last range if it's consecutive AND has the same metadata.
+		if (
+			$last_range['end'] === $entity_index - 1 &&
+			$last_range['metadata'] === $metadata
+		) {
+			$this->topologically_skipped_ranges[ $last_index ]['end'] = $entity_index;
+			return;
+		}
+
+		$this->topologically_skipped_ranges[] = array(
+			'start'    => $entity_index,
+			'end'      => $entity_index,
+			'metadata' => $metadata,
+		);
+	}
+
+	private function topologically_unskip_entity() {
+		$entity_index = $this->stream_cursor['last_entity_index'];
+		var_dump(' topologically unskipping entity: ' . $entity_index);
+		$ranges = &$this->topologically_skipped_ranges;
+
+		for ( $i = 0; $i < count( $ranges ); $i++ ) {
+			$range = $ranges[ $i ];
+
+			if ( $entity_index > $range['end'] ) {
+				continue;
+			}
+
+			/**
+			 * We've reached a range that starts after the entity we're trying to unskip.
+			 * This means the entity was not skipped in the first place.
+			 * 
+			 * For example:
+			 * 
+			 * [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+			 * [         x                  ] ← entity_index
+			 * [<----->        <-->         ] ← ranges
+			 * 
+			 * After skipping the first range (0, 2), we inspect the second range (5, 6).
+			 * The entity 3 is below the range. This means all the remaining ranges we'll see
+			 * will also start after the entity. This, we can stop processing ranges.
+			 */
+			if ( $entity_index < $range['start'] ) {
+				break;
+			}
+
+			// Single-element range – remove it entirely.
+			if ( $range['start'] === $range['end'] ) {
+				array_splice( $ranges, $i, 1 );
+				return $range['metadata'];
+			}
+
+			// Entity is at the start of the range – shrink from the left.
+			if ( $entity_index === $range['start'] ) {
+				$ranges[ $i ]['start'] = $entity_index + 1;
+				return $range['metadata'];
+			}
+
+			// Entity is at the end of the range – shrink from the right.
+			if ( $entity_index === $range['end'] ) {
+				$ranges[ $i ]['end'] = $entity_index - 1;
+				return $range['metadata'];
+			}
+
+			// Entity is in the middle – split into two ranges, preserving metadata.
+			$left_range = array(
+				'start'    => $range['start'],
+				'end'      => $entity_index - 1,
+				'metadata' => $range['metadata'],
+			);
+			$right_range = array(
+				'start'    => $entity_index + 1,
+				'end'      => $range['end'],
+				'metadata' => $range['metadata'],
+			);
+			array_splice( $ranges, $i, 1, array( $left_range, $right_range ) );
+			return $range['metadata'];
+		}
+	}
+
+	private function count_skipped_entities() {
+		$count = 0;
+		foreach ( $this->topologically_skipped_ranges as $range ) {
+			$count += $range['end'] - $range['start'] + 1;
+		}
+		return $count;
+	}
+
+	private function save_cursor() {
+		update_option( 'wp_import_cursor', json_encode( array(
+			'id' => $this->stream_cursor,
+			'version' => $this->version,
+			'base_url' => $this->base_url,
+
+			'processed_authors' => $this->processed_authors,
+			'author_mapping' => $this->author_mapping,
+			'processed_terms' => $this->processed_terms,
+			'processed_posts' => $this->processed_posts,
+			'processed_comments' => $this->processed_comments,
+			'post_orphans' => $this->post_orphans,
+			'processed_menu_items' => $this->processed_menu_items,
+			'menu_item_orphans' => $this->menu_item_orphans,
+			'missing_menu_items' => $this->missing_menu_items,
+			'fetch_attachments' => $this->fetch_attachments,
+			'options' => $this->options,
+			'import_file' => $this->import_file,
+			'stream_cursor' => $this->stream_cursor,
+			'first_full_run_done' => $this->first_full_run_done,
+			'topologically_skipped_before' => $this->topologically_skipped_before,
+		) ) );
+	}
+
+	private function restore_from_last_cursor() {
+		$last_cursor = get_option( 'wp_import_cursor' );
+		if ( false === $last_cursor ) {
+			$this->initialize_empty_stream_cursor();
+			return false;
+		}
+		$last_cursor = json_decode( $last_cursor, true );
+		if ( false === $last_cursor ) {
+			$this->initialize_empty_stream_cursor();
+			return false;
+		}
+
+		$this->version = $last_cursor['version'];
+		$this->base_url = $last_cursor['base_url'];
+
+		$this->processed_authors = $last_cursor['processed_authors'];
+		$this->author_mapping = $last_cursor['author_mapping'];
+		$this->processed_terms = $last_cursor['processed_terms'];
+		$this->processed_posts = $last_cursor['processed_posts'];
+		$this->processed_comments = $last_cursor['processed_comments'];
+		$this->post_orphans = $last_cursor['post_orphans'];
+		$this->processed_menu_items = $last_cursor['processed_menu_items'];
+		$this->menu_item_orphans = $last_cursor['menu_item_orphans'];
+		$this->missing_menu_items = $last_cursor['missing_menu_items'];
+		$this->fetch_attachments = $last_cursor['fetch_attachments'];
+		$this->options = $last_cursor['options'];
+		$this->import_file = $last_cursor['import_file'];
+		$this->stream_cursor = $last_cursor['stream_cursor'];
+		$this->first_full_run_done = $last_cursor['first_full_run_done'];
+		$this->topologically_skipped_before = $last_cursor['topologically_skipped_before'];
+		return true;
+	}
+
+	private function initialize_empty_stream_cursor() {
+		$this->stream_cursor = array(
+			'wxr_cursor' => null,
+			'last_entity_index'            => 0,
+			'last_entity_type'             => null,
+			'last_post_id'                 => null,
+			'last_comment_id'              => null,
+			'last_term_id'                 => null,
+			'current_post_id'              => null,
+			'current_comment_post_id'      => null,
+			'current_post_exists'          => null,
+			'post_context'                 => array(
+				'post'                     => null,
+				'comment_id_map'           => array(),
+				'pending_comment_meta'     => array(),
+			),
+			'last_term_context'            => array(),
+			'pending_entities'             => array(),
+		);
 	}
 
 	/**
@@ -702,87 +1117,6 @@ class WP_Import extends WP_Importer {
 		$this->stream_cursor['current_post_id']         = null;
 		$this->stream_cursor['current_comment_post_id'] = null;
 		$this->stream_cursor['current_post_exists']     = null;
-	}
-
-	/**
-	 * Applies any queued term meta for the last streamed term.
-	 */
-	protected function finalize_stream_term_meta() {
-		if ( empty( $this->stream_cursor['last_term_context'] ) ) {
-			return false;
-		}
-
-		if (
-			empty( $this->stream_cursor['last_term_context']['termmeta'] ) ||
-			empty( $this->stream_cursor['last_term_context']['processed']['created'] )
-		) {
-			$this->stream_cursor['last_term_context'] = array();
-			return false;
-		}
-
-		$term                                     = $this->stream_cursor['last_term_context']['term'];
-		$term['termmeta']                         = $this->stream_cursor['last_term_context']['termmeta'];
-		$processed_term_id                        = $this->stream_cursor['last_term_context']['processed']['term_id'];
-		$this->stream_cursor['last_term_context'] = array();
-
-		$this->process_termmetas( $term, $processed_term_id );
-
-		return true;
-	}
-
-	/**
-	 * Ensures pending term meta is applied before continuing the stream loop.
-	 *
-	 * @param string $entity_type Current entity type being processed.
-	 * @param array  $entity_data Current entity payload.
-	 * @return bool True when the entity was deferred for later processing.
-	 */
-	protected function defer_entity_until_term_meta_applied( $entity_type, array $entity_data ) {
-		if ( 'term_meta' === $entity_type ) {
-			return false;
-		}
-
-		if ( ! $this->finalize_stream_term_meta() ) {
-			return false;
-		}
-
-		array_unshift(
-			$this->stream_cursor['pending_entities'],
-			array(
-				'type' => $entity_type,
-				'data' => $entity_data,
-			)
-		);
-
-		return true;
-	}
-
-	/**
-	 * Applies any pending comment meta waiting for a streamed comment to be inserted.
-	 *
-	 * @param int|null $original_comment_id Original comment ID from the WXR file.
-	 * @param int      $inserted_comment_id Newly inserted comment ID.
-	 */
-	private function enqueue_comment_meta( $original_comment_id, $inserted_comment_id ) {
-		if ( null === $original_comment_id ) {
-			return;
-		}
-
-		if ( empty( $this->stream_cursor['post_context']['pending_comment_meta'][ $original_comment_id ] ) ) {
-			return;
-		}
-
-		foreach ( $this->stream_cursor['post_context']['pending_comment_meta'][ $original_comment_id ] as $meta ) {
-			$this->stream_cursor['pending_entities'][] = array(
-				'type' => 'enqueued_comment_meta',
-				'data' => array(
-					'comment_id' => $inserted_comment_id,
-					'meta'       => $meta,
-				),
-			);
-		}
-
-		unset( $this->stream_cursor['post_context']['pending_comment_meta'][ $original_comment_id ] );
 	}
 
 	/**
@@ -1590,6 +1924,10 @@ class WP_Import extends WP_Importer {
 			);
 		}
 
+		// Rewrite attachment URLs using the frontloaded URL mapping index.
+		$postdata['post_content'] = $this->rewrite_attachment_urls( $postdata['post_content'] );
+		$postdata['post_excerpt'] = $this->rewrite_attachment_urls( $postdata['post_excerpt'] );
+
 		$original_post_id = $post['post_id'];
 		$postdata         = apply_filters( 'wp_import_post_data_processed', $postdata, $post );
 
@@ -1994,9 +2332,34 @@ class WP_Import extends WP_Importer {
 			);
 		}
 
+		$original_url = $url;
+
 		// if the URL is absolute, but does not contain address, then upload it assuming base_site_url
 		if ( preg_match( '|^/[\w\W]+$|', $url ) ) {
 			$url = rtrim( $this->base_url, '/' ) . $url;
+		}
+
+		// Check if we already have a URL mapping from frontloading.
+		$existing_url = $this->get_mapped_url( $url );
+		if ( ! $existing_url ) {
+			$existing_url = $this->get_mapped_url( $original_url );
+		}
+
+		if ( $existing_url ) {
+			// The file was already downloaded during frontloading.
+			// Create the attachment post using the existing file.
+			$uploads = wp_upload_dir();
+			$file_path = str_replace( $uploads['baseurl'], $uploads['basedir'], $existing_url );
+
+			$info = wp_check_filetype( $file_path );
+			if ( $info ) {
+				$post['post_mime_type'] = $info['type'];
+			}
+			$post['guid'] = $existing_url;
+
+			$post_id = wp_insert_attachment( $post, $file_path );
+			wp_update_attachment_metadata( $post_id, wp_generate_attachment_metadata( $post_id, $file_path ) );
+			return $post_id;
 		}
 
 		$upload = $this->fetch_remote_file( $url, $post );
@@ -2017,6 +2380,12 @@ class WP_Import extends WP_Importer {
 		$post_id = wp_insert_attachment( $post, $upload['file'] );
 		wp_update_attachment_metadata( $post_id, wp_generate_attachment_metadata( $post_id, $upload['file'] ) );
 
+		// Store the URL mapping for post content rewriting.
+		$this->store_url_mapping( $url, $upload['url'] );
+		if ( $original_url !== $url ) {
+			$this->store_url_mapping( $original_url, $upload['url'] );
+		}
+
 		// remap resized image URLs, works by stripping the extension and remapping the URL stub.
 		if ( preg_match( '!^image/!', $info['type'] ) ) {
 			$parts = pathinfo( $url );
@@ -2026,6 +2395,12 @@ class WP_Import extends WP_Importer {
 			$name_new  = basename( $parts_new['basename'], ".{$parts_new['extension']}" );
 
 			$this->url_remap[ $parts['dirname'] . '/' . $name ] = $parts_new['dirname'] . '/' . $name_new;
+
+			// Also store the base path mapping for image resizes.
+			$this->store_url_mapping(
+				$parts['dirname'] . '/' . $name,
+				$parts_new['dirname'] . '/' . $name_new
+			);
 		}
 
 		return $post_id;
