@@ -167,10 +167,9 @@ class WP_Import extends WP_Importer {
 
 			wp_suspend_cache_invalidation( false );
 
-			// update incorrect/missing information in the DB
-			// $this->backfill_parents(); // Topological insertion of parents takes care of this now
-			$this->backfill_attachment_urls(); // @TODO: Process attachments before the posts, stream-rewrite attachments URLs as we go
-			$this->remap_featured_images(); // Should be solved by processing the attachments first and using the right _thumbnail_id right away on the first insert
+			// Topological insertion handles parent relationships.
+			// Inline URL rewriting during post insertion handles attachment URLs.
+			$this->remap_featured_images();
 		} else {
 			$this->process_categories();
 			$this->process_tags();
@@ -205,23 +204,132 @@ class WP_Import extends WP_Importer {
 
 	}
 
+	/**
+	 * Get the directory for URL mapping index files.
+	 */
+	private function get_url_index_dir() {
+		$uploads = wp_upload_dir();
+		if ( ! ( $uploads && false === $uploads['error'] ) ) {
+			return false;
+		}
+		return $uploads['basedir'] . '/wordpress-importer-url-index';
+	}
+
+	/**
+	 * Normalize a URL for comparison by removing query params and fragments.
+	 */
+	private function normalize_url_for_index( $url ) {
+		$parsed = parse_url( $url );
+		$normalized = '';
+		if ( isset( $parsed['scheme'] ) ) {
+			$normalized .= $parsed['scheme'] . '://';
+		}
+		if ( isset( $parsed['host'] ) ) {
+			$normalized .= $parsed['host'];
+		}
+		if ( isset( $parsed['port'] ) ) {
+			$normalized .= ':' . $parsed['port'];
+		}
+		if ( isset( $parsed['path'] ) ) {
+			$normalized .= $parsed['path'];
+		}
+		return $normalized;
+	}
+
+	/**
+	 * Store the new URL mapping for an attachment.
+	 */
+	private function store_url_mapping( $original_url, $new_url ) {
+		$index_dir = $this->get_url_index_dir();
+		if ( ! $index_dir ) {
+			return false;
+		}
+		if ( ! is_dir( $index_dir ) ) {
+			mkdir( $index_dir, 0755, true );
+		}
+		$normalized = $this->normalize_url_for_index( $original_url );
+		$index_file = $index_dir . '/' . base64_encode( $normalized ) . '.txt';
+		return file_put_contents( $index_file, $new_url );
+	}
+
+	/**
+	 * Get the new URL for an original attachment URL.
+	 */
+	private function get_mapped_url( $original_url ) {
+		$index_dir = $this->get_url_index_dir();
+		if ( ! $index_dir ) {
+			return false;
+		}
+		$normalized = $this->normalize_url_for_index( $original_url );
+		$index_file = $index_dir . '/' . base64_encode( $normalized ) . '.txt';
+		if ( ! file_exists( $index_file ) ) {
+			return false;
+		}
+		return trim( file_get_contents( $index_file ) );
+	}
+
+	/**
+	 * Build a URL mapping array from all indexed attachments.
+	 * Returns an array of [ original_url => new_url ].
+	 */
+	private function get_all_url_mappings() {
+		$index_dir = $this->get_url_index_dir();
+		if ( ! $index_dir || ! is_dir( $index_dir ) ) {
+			return array();
+		}
+
+		$mapping = array();
+		$files = glob( $index_dir . '/*.txt' );
+		foreach ( $files as $file ) {
+			$encoded = basename( $file, '.txt' );
+			$original_url = base64_decode( $encoded );
+			$new_url = trim( file_get_contents( $file ) );
+			if ( $original_url && $new_url ) {
+				$mapping[ $original_url ] = $new_url;
+			}
+		}
+		return $mapping;
+	}
+
+	/**
+	 * Rewrite asset URLs in content using the URL mapping index.
+	 * Handles image URLs with various sizes by matching the base path.
+	 */
+	private function rewrite_attachment_urls( $content ) {
+		$mapping = $this->get_all_url_mappings();
+		if ( empty( $mapping ) ) {
+			return $content;
+		}
+
+		// Sort by URL length descending to handle substrings correctly.
+		uksort( $mapping, function( $a, $b ) {
+			return strlen( $b ) - strlen( $a );
+		} );
+
+		foreach ( $mapping as $from_url => $to_url ) {
+			// Replace the exact URL.
+			$content = str_replace( $from_url, $to_url, $content );
+
+			// Also handle image resizes: replace the base path (without extension).
+			// e.g., image.jpg -> image-300x200.jpg
+			$from_parts = pathinfo( $from_url );
+			$to_parts = pathinfo( $to_url );
+			if ( isset( $from_parts['dirname'], $from_parts['filename'], $to_parts['dirname'], $to_parts['filename'] ) ) {
+				$from_base = $from_parts['dirname'] . '/' . $from_parts['filename'];
+				$to_base = $to_parts['dirname'] . '/' . $to_parts['filename'];
+				if ( $from_base !== $to_base ) {
+					$content = str_replace( $from_base, $to_base, $content );
+				}
+			}
+		}
+
+		return $content;
+	}
+
 	private function frontload_attachments() {
 		$reader = WXREntityReader::create_for_wordpress_importer( $this->import_file );
 		if ( ! $reader ) {
 			throw new \Exception( 'Failed to create entity reader for frontloading attachments.' );
-		}
-
-		// Create a temporary directory for attachments to serve as a 
-		// state database for the entity import process. We can encode
-		// all the information we need using filenames and, thus, avoid
-		// using MySQL at all.
-		$uploads = wp_upload_dir();
-		if ( ! ( $uploads && false === $uploads['error'] ) ) {
-			return new WP_Error( 'upload_dir_error', $uploads['error'] );
-		}
-		$frontloading_root = $uploads['basedir'] . '/wordpress-importer-attachments';
-		if ( ! is_dir( $frontloading_root ) ) {
-			mkdir( $frontloading_root, 0755, true );
 		}
 
 		while ( $reader->next_entity() ) {
@@ -235,45 +343,13 @@ class WP_Import extends WP_Importer {
 				continue;
 			}
 
-			$base64_original_url = base64_encode( $original_url );
-			$new_file_dir = $frontloading_root . '/' . $base64_original_url;
-			if ( count( glob( $new_file_dir . '/*' )  ) > 0 ) {
-				// We have already downloaded this attachment, let's move on to the next one.
+			$original_url = isset( $post['attachment_url'] ) ? $post['attachment_url'] : '';
+			$url = ! empty( $original_url ) ? $original_url : $post['guid'];
+
+			// Skip if we've already processed this URL.
+			if ( $this->get_mapped_url( $url ) ) {
 				continue;
 			}
-
-			/**
-			 * We need to make a choice here:
-			 *
-			 * 1. Download all the attachments upfront, store the resulting post in
-			 *    the cursor, reuse it when processing the posts later. Downside: process_post
-			 *    has some additional logiv we'll need to duplicate.
-			 * 2. Process the topmost parent attachments first, then their children etc.
-			 *    So a topological frontloading intertwined with inserting the posts.
-			 *    Would that save us any storage? Perhaps, I'm not sure yet.
-			 * 
-			 * Let's try 1 and see what happens.
-			 * 
-			 * Well, nope. If we do insert the attachment posts at this point, we'll need
-			 * to assign them to the right parents. Those do not exist, yet! And there is a
-			 * circular dependency between the attachment post and its parent post:
-			 * 
-			 * The parent needs the attachment post to be displayed correctly. The attachment
-			 * post needs the parent post to be inserted and have a proper ID before it can
-			 * be created with the right post_parent.
-			 * 
-			 * Therefore we must either:
-			 *
-			 * 1. Download all the attachment media files upfront and store them on the disk with
-			 *    the right metadata attached – so that they can be readily reused on the next pass
-			 *    of the import loop.
-			 * 2. Insert the attachment posts first with a placeholder post_parent, set the post_parent
-			 *    id via an UPDATE query afterwards.
-			 * 
-			 * Let's try 1 and use the file structure on the disk as a frontloading state database.
-			 */
-			$original_url = $post['attachment_url'];
-			$url = ! empty( $original_url ) ? $original_url : $post['guid'];
 
 			// if the URL is absolute, but does not contain address, then upload it assuming base_site_url
 			if ( preg_match( '|^/[\w\W]+$|', $url ) ) {
@@ -294,25 +370,21 @@ class WP_Import extends WP_Importer {
 				}
 			}
 
-			$uploaded_file = $this->fetch_remote_file( $url, $post );
-			if ( is_wp_error( $uploaded_file ) ) {
-				// TODO: Handle error: "Failed to fetch remote file"
+			$upload = $this->fetch_remote_file( $url, $post );
+			if ( is_wp_error( $upload ) ) {
 				continue;
 			}
 
-			$info = wp_check_filetype( $uploaded_file['file'] );
+			$info = wp_check_filetype( $upload['file'] );
 			if ( ! $info ) {
-				// TODO: Handle error: "Invalid file type"
 				continue;
 			}
 
-			// Move the downloaded file to the frontloading root directory.
-			// Wrap it in a directory with a name encoding the original URL.
-			if ( ! is_dir( $new_file_dir ) ) {
-				mkdir( $new_file_dir, 0755, true );
+			// Store the URL mapping: original URL -> new uploaded URL.
+			$this->store_url_mapping( $url, $upload['url'] );
+			if ( $original_url && $original_url !== $url ) {
+				$this->store_url_mapping( $original_url, $upload['url'] );
 			}
-			$new_file_path = $new_file_dir . '/' . basename( $uploaded_file['file'] );
-			rename( $uploaded_file['file'], $new_file_path );
 
 			$this->save_cursor();
 		}
@@ -1852,6 +1924,10 @@ class WP_Import extends WP_Importer {
 			);
 		}
 
+		// Rewrite attachment URLs using the frontloaded URL mapping index.
+		$postdata['post_content'] = $this->rewrite_attachment_urls( $postdata['post_content'] );
+		$postdata['post_excerpt'] = $this->rewrite_attachment_urls( $postdata['post_excerpt'] );
+
 		$original_post_id = $post['post_id'];
 		$postdata         = apply_filters( 'wp_import_post_data_processed', $postdata, $post );
 
@@ -2256,9 +2332,34 @@ class WP_Import extends WP_Importer {
 			);
 		}
 
+		$original_url = $url;
+
 		// if the URL is absolute, but does not contain address, then upload it assuming base_site_url
 		if ( preg_match( '|^/[\w\W]+$|', $url ) ) {
 			$url = rtrim( $this->base_url, '/' ) . $url;
+		}
+
+		// Check if we already have a URL mapping from frontloading.
+		$existing_url = $this->get_mapped_url( $url );
+		if ( ! $existing_url ) {
+			$existing_url = $this->get_mapped_url( $original_url );
+		}
+
+		if ( $existing_url ) {
+			// The file was already downloaded during frontloading.
+			// Create the attachment post using the existing file.
+			$uploads = wp_upload_dir();
+			$file_path = str_replace( $uploads['baseurl'], $uploads['basedir'], $existing_url );
+
+			$info = wp_check_filetype( $file_path );
+			if ( $info ) {
+				$post['post_mime_type'] = $info['type'];
+			}
+			$post['guid'] = $existing_url;
+
+			$post_id = wp_insert_attachment( $post, $file_path );
+			wp_update_attachment_metadata( $post_id, wp_generate_attachment_metadata( $post_id, $file_path ) );
+			return $post_id;
 		}
 
 		$upload = $this->fetch_remote_file( $url, $post );
@@ -2279,6 +2380,12 @@ class WP_Import extends WP_Importer {
 		$post_id = wp_insert_attachment( $post, $upload['file'] );
 		wp_update_attachment_metadata( $post_id, wp_generate_attachment_metadata( $post_id, $upload['file'] ) );
 
+		// Store the URL mapping for post content rewriting.
+		$this->store_url_mapping( $url, $upload['url'] );
+		if ( $original_url !== $url ) {
+			$this->store_url_mapping( $original_url, $upload['url'] );
+		}
+
 		// remap resized image URLs, works by stripping the extension and remapping the URL stub.
 		if ( preg_match( '!^image/!', $info['type'] ) ) {
 			$parts = pathinfo( $url );
@@ -2288,6 +2395,12 @@ class WP_Import extends WP_Importer {
 			$name_new  = basename( $parts_new['basename'], ".{$parts_new['extension']}" );
 
 			$this->url_remap[ $parts['dirname'] . '/' . $name ] = $parts_new['dirname'] . '/' . $name_new;
+
+			// Also store the base path mapping for image resizes.
+			$this->store_url_mapping(
+				$parts['dirname'] . '/' . $name,
+				$parts_new['dirname'] . '/' . $name_new
+			);
 		}
 
 		return $post_id;
