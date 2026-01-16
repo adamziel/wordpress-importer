@@ -919,9 +919,9 @@ class WP_Import extends WP_Importer {
 	/**
 	 * Extracts image URLs from HTML content.
 	 *
-	 * Uses DOMDocument when available for robust HTML parsing that correctly
-	 * handles quoted attributes, malformed markup, and edge cases. Falls back
-	 * to regex for environments without DOMDocument support.
+	 * Uses WP_HTML_Tag_Processor for reliable HTML parsing that correctly
+	 * handles quoted attributes, malformed markup, and edge cases without
+	 * the overhead of building a full DOM tree.
 	 *
 	 * @param string $content Post content HTML.
 	 * @return array Unique image URLs, excluding data URIs.
@@ -929,34 +929,26 @@ class WP_Import extends WP_Importer {
 	protected function extract_image_urls( $content ) {
 		$urls = array();
 
-		if ( ! class_exists( 'DOMDocument' ) ) {
-			// Regex fallback - less robust but works without DOMDocument
+		// WP_HTML_Tag_Processor available since WordPress 6.2
+		if ( class_exists( 'WP_HTML_Tag_Processor' ) ) {
+			$processor = new WP_HTML_Tag_Processor( $content );
+
+			// Find all IMG tags and extract their src attributes
+			while ( $processor->next_tag( 'IMG' ) ) {
+				$src = $processor->get_attribute( 'src' );
+				if ( is_string( $src ) && ! empty( $src ) ) {
+					$urls[] = $src;
+				}
+			}
+		} else {
+			// Fallback for older WordPress versions using regex
 			preg_match_all( '/<img[^>]+src=["\']([^"\']+)["\'][^>]*>/i', $content, $matches );
 			if ( ! empty( $matches[1] ) ) {
 				$urls = $matches[1];
 			}
-		} else {
-			// Suppress warnings for malformed HTML
-			$prev_use_errors = libxml_use_internal_errors( true );
-
-			$dom = new DOMDocument();
-			$dom->loadHTML(
-				'<?xml encoding="UTF-8">' . $content,
-				LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD
-			);
-
-			$images = $dom->getElementsByTagName( 'img' );
-			foreach ( $images as $img ) {
-				$src = $img->getAttribute( 'src' );
-				if ( ! empty( $src ) ) {
-					$urls[] = $src;
-				}
-			}
-
-			libxml_use_internal_errors( $prev_use_errors );
 		}
 
-		// Remove duplicates and data URIs
+		// Remove duplicates and data URIs (inline base64 images)
 		$urls = array_unique( $urls );
 		$urls = array_filter(
 			$urls,
