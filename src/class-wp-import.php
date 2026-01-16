@@ -846,11 +846,14 @@ class WP_Import extends WP_Importer {
 	}
 
 	/**
-	 * Extract and import images from post content.
+	 * Extracts images from post content and creates media library entries.
 	 *
-	 * This runs after all posts and explicit attachments have been processed,
-	 * but before URL backfilling. It finds <img> tags in post content, downloads
-	 * the images, and creates attachment entries.
+	 * Some WXR exports contain images only as <img> tags without corresponding
+	 * attachment entries, making them inaccessible in the media library. This
+	 * method finds those orphaned images and imports them.
+	 *
+	 * Runs after explicit attachments are processed to enable duplicate detection.
+	 * Runs before URL backfilling so imported images benefit from URL rewriting.
 	 */
 	protected function process_images_from_content() {
 		if ( ! $this->import_images_from_content ) {
@@ -914,19 +917,20 @@ class WP_Import extends WP_Importer {
 	}
 
 	/**
-	 * Extract image URLs from post content.
+	 * Extracts image URLs from HTML content.
 	 *
-	 * Finds all <img> tags and extracts their src attributes.
+	 * Uses DOMDocument when available for robust HTML parsing that correctly
+	 * handles quoted attributes, malformed markup, and edge cases. Falls back
+	 * to regex for environments without DOMDocument support.
 	 *
 	 * @param string $content Post content HTML.
-	 * @return array Array of image URLs.
+	 * @return array Unique image URLs, excluding data URIs.
 	 */
 	protected function extract_image_urls( $content ) {
 		$urls = array();
 
-		// Use DOMDocument for reliable HTML parsing
 		if ( ! class_exists( 'DOMDocument' ) ) {
-			// Fallback to regex if DOMDocument not available
+			// Regex fallback - less robust but works without DOMDocument
 			preg_match_all( '/<img[^>]+src=["\']([^"\']+)["\'][^>]*>/i', $content, $matches );
 			if ( ! empty( $matches[1] ) ) {
 				$urls = $matches[1];
@@ -965,22 +969,22 @@ class WP_Import extends WP_Importer {
 	}
 
 	/**
-	 * Import a single image from content.
+	 * Downloads an image and creates a media library entry.
+	 *
+	 * Skips images that were already imported as explicit attachments or
+	 * previously processed to avoid creating duplicates.
 	 *
 	 * @param string $url        Image URL to import.
-	 * @param int    $parent_id  Parent post ID.
-	 * @return string Result: 'imported', 'skipped', or 'failed'.
+	 * @param int    $parent_id  Parent post ID to attach the image to.
+	 * @return string 'imported' on success, 'skipped' for duplicates, 'failed' on error.
 	 */
 	protected function import_image_from_content( $url, $parent_id ) {
-		// Normalize URL (handle relative URLs)
 		$url = $this->normalize_image_url( $url );
 
-		// Skip if already processed as explicit attachment
 		if ( $this->is_explicit_attachment_url( $url ) ) {
 			return 'skipped';
 		}
 
-		// Skip if already in url_remap (already downloaded)
 		if ( isset( $this->url_remap[ $url ] ) ) {
 			return 'skipped';
 		}
@@ -1037,10 +1041,11 @@ class WP_Import extends WP_Importer {
 			wp_generate_attachment_metadata( $attachment_id, $upload['file'] )
 		);
 
-		// Add to URL remap for later content updating
+		// Register URL mapping so backfill_attachment_urls() updates post content
 		$this->url_remap[ $url ] = $upload['url'];
 
-		// Handle image variations (same as process_attachment)
+		// Also map the base filename for WordPress resized images (image-300x200.jpg)
+		// This ensures content referencing resized versions gets updated correctly
 		if ( $info && preg_match( '!^image/!', $info['type'] ) ) {
 			$parts = pathinfo( $url );
 			$name  = basename( $parts['basename'], ".{$parts['extension']}" );
@@ -1055,12 +1060,14 @@ class WP_Import extends WP_Importer {
 	}
 
 	/**
-	 * Normalize an image URL for comparison.
+	 * Normalizes an image URL to enable reliable duplicate detection.
 	 *
-	 * Handles relative URLs, removes query strings, and applies base URL rewriting.
+	 * Converts relative URLs to absolute, strips query strings (e.g., ?w=300),
+	 * and applies base URL rewriting when enabled. This ensures URLs from the
+	 * export site can be compared against local URLs after import.
 	 *
 	 * @param string $url Image URL to normalize.
-	 * @return string Normalized URL.
+	 * @return string Normalized absolute URL.
 	 */
 	protected function normalize_image_url( $url ) {
 		// Handle relative URLs
@@ -1089,12 +1096,14 @@ class WP_Import extends WP_Importer {
 	}
 
 	/**
-	 * Check if a URL is from an explicit attachment entry.
+	 * Determines whether a URL matches an explicit attachment from the export.
 	 *
-	 * Compares against all tracked attachment URLs, including variations.
+	 * Prevents duplicate imports by checking if an image was already listed as
+	 * an attachment entry in the WXR file. Handles both exact matches and
+	 * WordPress-generated resized versions (e.g., image-300x200.jpg).
 	 *
 	 * @param string $url URL to check.
-	 * @return bool True if URL is from explicit attachment.
+	 * @return bool True if URL matches an explicit attachment.
 	 */
 	protected function is_explicit_attachment_url( $url ) {
 		// Direct match
@@ -1122,17 +1131,29 @@ class WP_Import extends WP_Importer {
 	}
 
 	/**
-	 * Check if one URL is a resized version of another.
+	 * Determines whether two URLs represent the same image at different sizes.
 	 *
-	 * WordPress adds suffixes like -300x200 to resized images.
+	 * WordPress generates multiple sizes for uploaded images (thumbnail, medium,
+	 * large, etc.) with suffixes like -300x200. This prevents treating resized
+	 * versions as separate images when checking for duplicates.
 	 *
-	 * @param string $url1 First URL.
-	 * @param string $url2 Second URL.
-	 * @return bool True if one is a resized version of the other.
+	 * @param string $url1 First URL to compare.
+	 * @param string $url2 Second URL to compare.
+	 * @return bool True if both URLs point to the same base image.
 	 */
 	protected function is_resized_version( $url1, $url2 ) {
-		// Strip size suffixes: -150x150, -300x200, etc.
-		$pattern = '/-\d+x\d+(\.[a-zA-Z]{3,4})$/';
+		// Build regex pattern using WordPress's list of allowed file extensions
+		// instead of hardcoding extension lengths, supporting jpeg, webp, etc.
+		$mime_types = wp_get_mime_types();
+		$extensions = array();
+		foreach ( $mime_types as $exts => $mime ) {
+			$extensions = array_merge( $extensions, explode( '|', $exts ) );
+		}
+		$extensions = array_unique( $extensions );
+		$ext_pattern = implode( '|', array_map( 'preg_quote', $extensions ) );
+
+		// Strip WordPress size suffixes (e.g., -150x150, -300x200) from both URLs
+		$pattern = '/-\d+x\d+(\.' . $ext_pattern . ')$/i';
 
 		$base1 = preg_replace( $pattern, '$1', $url1 );
 		$base2 = preg_replace( $pattern, '$1', $url2 );
