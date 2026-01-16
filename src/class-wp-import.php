@@ -860,6 +860,12 @@ class WP_Import extends WP_Importer {
 			return;
 		}
 
+		// Requires WP_HTML_Tag_Processor (WordPress 6.2+)
+		if ( ! class_exists( 'WP_HTML_Tag_Processor' ) ) {
+			echo '<div class="error"><p><strong>' . __( 'Extracting images from post content requires WordPress 6.2 or newer. The import will continue without extracting images from content.', 'wordpress-importer' ) . '</strong></p></div>';
+			return;
+		}
+
 		// Get all posts that have been imported (not attachments)
 		$post_ids = array();
 		foreach ( $this->processed_posts as $new_id ) {
@@ -927,24 +933,14 @@ class WP_Import extends WP_Importer {
 	 * @return array Unique image URLs, excluding data URIs.
 	 */
 	protected function extract_image_urls( $content ) {
-		$urls = array();
+		$processor = new WP_HTML_Tag_Processor( $content );
+		$urls      = array();
 
-		// WP_HTML_Tag_Processor available since WordPress 6.2
-		if ( class_exists( 'WP_HTML_Tag_Processor' ) ) {
-			$processor = new WP_HTML_Tag_Processor( $content );
-
-			// Find all IMG tags and extract their src attributes
-			while ( $processor->next_tag( 'IMG' ) ) {
-				$src = $processor->get_attribute( 'src' );
-				if ( is_string( $src ) && ! empty( $src ) ) {
-					$urls[] = $src;
-				}
-			}
-		} else {
-			// Fallback for older WordPress versions using regex
-			preg_match_all( '/<img[^>]+src=["\']([^"\']+)["\'][^>]*>/i', $content, $matches );
-			if ( ! empty( $matches[1] ) ) {
-				$urls = $matches[1];
+		// Find all IMG tags and extract their src attributes
+		while ( $processor->next_tag( 'IMG' ) ) {
+			$src = $processor->get_attribute( 'src' );
+			if ( is_string( $src ) && ! empty( $src ) ) {
+				$urls[] = $src;
 			}
 		}
 
@@ -991,61 +987,18 @@ class WP_Import extends WP_Importer {
 			'guid'           => $url,
 		);
 
-		// Download the file
-		$upload = $this->fetch_remote_file( $url, $attachment_data );
-
-		if ( is_wp_error( $upload ) ) {
-			if ( defined( 'IMPORT_DEBUG' ) && IMPORT_DEBUG ) {
-				printf(
-					'<p>' . __( 'Failed to import image from content: %s - %s', 'wordpress-importer' ) . '</p>',
-					esc_html( $url ),
-					esc_html( $upload->get_error_message() )
-				);
-			}
-			return 'failed';
-		}
-
-		// Create attachment
-		$info = wp_check_filetype( $upload['file'] );
-		if ( $info ) {
-			$attachment_data['post_mime_type'] = $info['type'];
-		} else {
-			return 'failed';
-		}
-
-		$attachment_data['guid'] = $upload['url'];
-
-		$attachment_id = wp_insert_attachment( $attachment_data, $upload['file'], $parent_id );
+		// Use existing process_attachment method to handle download and creation
+		$attachment_id = $this->process_attachment( $attachment_data, $url );
 
 		if ( is_wp_error( $attachment_id ) ) {
 			if ( defined( 'IMPORT_DEBUG' ) && IMPORT_DEBUG ) {
 				printf(
-					'<p>' . __( 'Failed to create attachment for: %s', 'wordpress-importer' ) . '</p>',
-					esc_html( $url )
+					'<p>' . __( 'Failed to import image from content: %s - %s', 'wordpress-importer' ) . '</p>',
+					esc_html( $url ),
+					esc_html( $attachment_id->get_error_message() )
 				);
 			}
 			return 'failed';
-		}
-
-		// Generate attachment metadata
-		wp_update_attachment_metadata(
-			$attachment_id,
-			wp_generate_attachment_metadata( $attachment_id, $upload['file'] )
-		);
-
-		// Register URL mapping so backfill_attachment_urls() updates post content
-		$this->url_remap[ $url ] = $upload['url'];
-
-		// Also map the base filename for WordPress resized images (image-300x200.jpg)
-		// This ensures content referencing resized versions gets updated correctly
-		if ( $info && preg_match( '!^image/!', $info['type'] ) ) {
-			$parts = pathinfo( $url );
-			$name  = basename( $parts['basename'], ".{$parts['extension']}" );
-
-			$parts_new = pathinfo( $upload['url'] );
-			$name_new  = basename( $parts_new['basename'], ".{$parts_new['extension']}" );
-
-			$this->url_remap[ $parts['dirname'] . '/' . $name ] = $parts_new['dirname'] . '/' . $name_new;
 		}
 
 		return 'imported';

@@ -350,9 +350,9 @@ https://playground.internal/path-not-taken was the second best choice.
 			await expect(page.getByRole('link', { name: 'One' })).toBeVisible();
 			await expect(page.locator('a[href="https://w.org"]')).toBeVisible();
 		});
-	
 	});
-		test(`imports images from post content`, async ({ page, request }) => {
+
+	test(`imports images from post content`, async ({ page, request }) => {
 		await withPlaygroundServer(async () => {
 			test.setTimeout(300000);
 
