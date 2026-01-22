@@ -306,6 +306,59 @@ https://playground.internal/path-not-taken was the second best choice.
 			expect(reply.parent).toBe(parentComment.id);
 		},
 	},
+	{
+		name: 'topological-tricky',
+		file: 'wxr-topological-tricky.xml',
+		options: {
+			fetchAttachments: true,
+		},
+		validate: async ({ page, request }) => {
+			const childRes = await request.get(
+				abs(
+					'/wp-json/wp/v2/pages?search=Child%20Before%20Parent%20%28Topological%29&per_page=5'
+				)
+			);
+			expect(childRes.ok()).toBeTruthy();
+			const childCandidates = await childRes.json();
+			const childPage = childCandidates.find(
+				(pageData) => pageData.slug === 'child-before-parent-topological'
+			);
+			expect(childPage).toBeTruthy();
+			expect(childPage.parent).toBeGreaterThan(0);
+
+			const parentRes = await request.get(abs(`/wp-json/wp/v2/pages/${childPage.parent}`));
+			expect(parentRes.ok()).toBeTruthy();
+			const parentPage = await parentRes.json();
+			expect(parentPage.slug).toBe('parent-landing-page-topological');
+
+			const posts = await getPosts(request, 'Featured Before Attachment', 5);
+			const featuredPost = posts.find((post) => post.slug === 'featured-before-attachment');
+			expect(featuredPost).toBeTruthy();
+			expect(featuredPost.featured_media).toBeGreaterThan(0);
+
+			const mediaRes = await request.get(
+				abs(`/wp-json/wp/v2/media/${featuredPost.featured_media}`)
+			);
+			expect(mediaRes.ok()).toBeTruthy();
+			const media = await mediaRes.json();
+			expect(media.slug).toBe('topological-attachment');
+
+			const commentsRes = await request.get(
+				abs(`/wp-json/wp/v2/comments?post=${featuredPost.id}&per_page=10`)
+			);
+			expect(commentsRes.ok()).toBeTruthy();
+			const comments = await commentsRes.json();
+			const reply = comments.find((comment) =>
+				(comment.content?.rendered || '').includes('Reply arrives before its parent')
+			);
+			const parentComment = comments.find((comment) =>
+				(comment.content?.rendered || '').includes('Parent comment that should adopt children')
+			);
+			expect(reply).toBeTruthy();
+			expect(parentComment).toBeTruthy();
+			expect(reply.parent).toBe(parentComment.id);
+		},
+	},
 ];
 
 // Run tests for each parser
@@ -547,7 +600,7 @@ test.describe('Streaming Entity Loop', () => {
 	STREAMING_PARSERS.forEach((parser) => {
 		test.describe(`with ${parser} parser`, () => {
 			FIXTURES.forEach((fixture) => {
-				test.only(`imports ${fixture.name} fixture using streaming loop`, async ({
+				test(`imports ${fixture.name} fixture using streaming loop`, async ({
 					page,
 					request,
 				}) => {

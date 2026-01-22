@@ -40,6 +40,7 @@ class WP_Import extends WP_Importer {
 	public $processed_menu_items = array();
 	public $menu_item_orphans    = array();
 	public $missing_menu_items   = array();
+	public $menu_item_types      = array();
 
 	public $fetch_attachments = false;
 	public $url_remap         = array();
@@ -72,6 +73,8 @@ class WP_Import extends WP_Importer {
 	//        It would contain both the stream cursor and the global importer state.
 	private $topologically_skipped_ranges = array();
 	private $first_full_run_done = false;
+	private $frontloading_done = false;
+	private $frontload_cursor = null;
 
 	/**
 	 * Registered callback function for the WordPress Importer
@@ -132,7 +135,12 @@ class WP_Import extends WP_Importer {
 		add_filter( 'import_post_meta_key', array( $this, 'is_valid_meta_key' ) );
 		add_filter( 'http_request_timeout', array( &$this, 'bump_request_timeout' ) );
 
-		$this->import_start( $file );
+		$use_streaming_loop = ! empty( $this->options['stream_entities'] );
+		if ( $use_streaming_loop ) {
+			$this->import_start_streaming( $file );
+		} else {
+			$this->import_start( $file );
+		}
 
 		/**
 		 * If URL rewriting was requested but the WP version is too old, report
@@ -159,10 +167,19 @@ class WP_Import extends WP_Importer {
 
 		$this->get_author_mapping();
 
-		$use_streaming_loop = ! empty( $this->options['stream_entities'] );
-
 		wp_suspend_cache_invalidation( true );
 		if ( $use_streaming_loop ) {
+			if ( $this->fetch_attachments ) {
+				if ( ! $this->frontloading_done ) {
+					$this->frontload_attachments();
+				}
+				if ( ! $this->frontloading_done ) {
+					wp_suspend_cache_invalidation( false );
+					wp_defer_term_counting( false );
+					wp_defer_comment_counting( false );
+					return;
+				}
+			}
 			$this->run_topological_entity_loop();
 
 			wp_suspend_cache_invalidation( false );
@@ -327,19 +344,22 @@ class WP_Import extends WP_Importer {
 	}
 
 	private function frontload_attachments() {
-		$reader = WXREntityReader::create_for_wordpress_importer( $this->import_file );
+		$reader = WXREntityReader::create_for_wordpress_importer( $this->import_file, $this->frontload_cursor );
 		if ( ! $reader ) {
 			throw new \Exception( 'Failed to create entity reader for frontloading attachments.' );
 		}
 
 		while ( $reader->next_entity() ) {
+			$this->frontload_cursor = $reader->get_reentrancy_cursor();
 			$entity = $reader->get_entity();
 			if ( $entity->get_type() !== 'post' ) {
+				$this->save_cursor();
 				continue;
 			}
 
 			$post = $entity->get_data();
 			if ( $post['post_type'] !== 'attachment' ) {
+				$this->save_cursor();
 				continue;
 			}
 
@@ -348,6 +368,7 @@ class WP_Import extends WP_Importer {
 
 			// Skip if we've already processed this URL.
 			if ( $this->get_mapped_url( $url ) ) {
+				$this->save_cursor();
 				continue;
 			}
 
@@ -372,11 +393,13 @@ class WP_Import extends WP_Importer {
 
 			$upload = $this->fetch_remote_file( $url, $post );
 			if ( is_wp_error( $upload ) ) {
+				$this->save_cursor();
 				continue;
 			}
 
 			$info = wp_check_filetype( $upload['file'] );
 			if ( ! $info ) {
+				$this->save_cursor();
 				continue;
 			}
 
@@ -388,6 +411,10 @@ class WP_Import extends WP_Importer {
 
 			$this->save_cursor();
 		}
+
+		$this->frontloading_done = true;
+		$this->frontload_cursor  = null;
+		$this->save_cursor();
 	}
 
 	/**
@@ -419,11 +446,6 @@ class WP_Import extends WP_Importer {
 			$this->save_cursor();
 
 			$skipped_after = $this->count_skipped_entities();
-			var_dump([
-				'skipped_after' => $skipped_after,
-				'topologically_skipped_before' => $this->topologically_skipped_before,
-			]);
-			var_dump($this->topologically_skipped_ranges);
 			if ( $skipped_after === $this->topologically_skipped_before || $skipped_after === 0 ) {
 				// The latest run did not process any more entities. The next
 				// run will not process any more entities either. We're done.
@@ -455,13 +477,24 @@ class WP_Import extends WP_Importer {
 			$this->stream_cursor['wxr_cursor'] = $reader->get_reentrancy_cursor();
 			++$this->stream_cursor['last_entity_index'];
 
+			$entity = $reader->get_entity();
+			if ( ! $entity instanceof ImportEntity ) {
+				// TODO: Handle error. Why would get_entity() return anything else, though?
+				$this->finalize_stream_post_context();
+				return;
+			}
+
+			$data                                    = $entity->get_data();
+			$entity_type                             = $entity->get_type();
+			$this->stream_cursor['last_entity_type'] = $entity_type;
+
 			/**
 			 * Once we've processed the full data set for the first time, we only
 			 * want to continue processing entities that were topologically skipped
 			 * before.
 			 */
 			if ( $this->first_full_run_done ) {
-				if( $this->is_topologically_skipped( $this->stream_cursor['last_entity_index'] )) {
+				if ( $this->is_topologically_skipped( $this->stream_cursor['last_entity_index'] ) ) {
 					$metadata = $this->topologically_unskip_entity();
 					if ( isset( $metadata['current_post_id'] ) ) {
 						$this->stream_cursor['current_post_id'] = $metadata['current_post_id'];
@@ -472,22 +505,20 @@ class WP_Import extends WP_Importer {
 					if ( isset( $metadata['current_post_exists'] ) ) {
 						$this->stream_cursor['current_post_exists'] = $metadata['current_post_exists'];
 					}
+					if ( isset( $metadata['current_post_type'] ) ) {
+						$this->stream_cursor['current_post_type'] = $metadata['current_post_type'];
+					}
+					if ( isset( $metadata['current_post_original_id'] ) ) {
+						$this->stream_cursor['current_post_original_id'] = $metadata['current_post_original_id'];
+					}
 				} else {
+					if ( 'post' === $entity_type ) {
+						$this->finalize_stream_post_context();
+					}
+					$this->save_cursor();
 					return null;
 				}
 			}
-
-			$entity = $reader->get_entity();
-			if ( ! $entity instanceof ImportEntity ) {
-				// TODO: Handle error. Why would get_entity() return anything else, though?
-				$this->finalize_stream_post_context();
-				var_dump(' ENTITY NOT INSTANCE OF ImportEntity, returning null');
-				return;
-			}
-
-			$data                                    = $entity->get_data();
-			$entity_type                             = $entity->get_type();
-			$this->stream_cursor['last_entity_type'] = $entity_type;
 		}
 
 		switch ( $entity_type ) {
@@ -706,6 +737,8 @@ class WP_Import extends WP_Importer {
 				if ( $post_parent > 0 ) {
 					if ( ! isset( $this->processed_posts[ $post_parent ] ) ) {
 						$this->topological_skip_entity();
+						$this->stream_cursor['skipping_post_entities'] = true;
+						$this->save_cursor();
 						return;
 					}
 					// Imported parent ID => new parent ID translation is handled in the process_post()
@@ -753,11 +786,6 @@ class WP_Import extends WP_Importer {
 					break;
 				}
 
-				if ( 'nav_menu_item' === $post['post_type'] ) {
-					$this->process_menu_item( $post );
-					break;
-				}
-
 				$post_type_object = get_post_type_object( $post['post_type'] );
 				if ( ! $post_type_object ) {
 					break;
@@ -789,9 +817,21 @@ class WP_Import extends WP_Importer {
 				$this->stream_cursor['current_post_id']         = $post_id;
 				$this->stream_cursor['current_comment_post_id'] = $comment_post_id;
 				$this->stream_cursor['current_post_exists']     = $post_exists;
+				$this->stream_cursor['current_post_type']       = $post['post_type'];
+				$this->stream_cursor['current_post_original_id'] = isset( $post['post_id'] ) ? (int) $post['post_id'] : null;
+
+				if ( 'nav_menu_item' === $post['post_type'] && ! empty( $post['post_id'] ) ) {
+					$this->processed_menu_items[ intval( $post['post_id'] ) ] = (int) $post_id;
+				}
 				break;
 
 			case 'post_meta':
+				if ( ! empty( $this->stream_cursor['skipping_post_entities'] ) ) {
+					$this->topological_skip_entity();
+					$this->save_cursor();
+					return;
+				}
+
 				if ( empty( $this->stream_cursor['current_post_id'] ) ) {
 					// TODO: Log something – we just saw a post meta outside of a post context. The
 					//       only thing we can do is skip it.
@@ -806,32 +846,114 @@ class WP_Import extends WP_Importer {
 					break;
 				}
 
+				$key = apply_filters( 'import_post_meta_key', $key, $this->stream_cursor['current_post_id'], $this->stream_cursor['post_context']['post'] );
+				if ( ! $key ) {
+					break;
+				}
+
 				$meta = array(
 					'key'   => $key,
 					'value' => isset( $data['value'] ) ? $data['value'] : ( isset( $data['meta_value'] ) ? $data['meta_value'] : '' ),
 				);
 
+				$skip_metadata = array(
+					'current_post_id'         => $this->stream_cursor['current_post_id'],
+					'current_comment_post_id' => $this->stream_cursor['current_comment_post_id'],
+					'current_post_exists'     => $this->stream_cursor['current_post_exists'],
+					'current_post_type'       => $this->stream_cursor['current_post_type'],
+					'current_post_original_id' => $this->stream_cursor['current_post_original_id'],
+				);
+
+				if ( '_thumbnail_id' === $meta['key'] ) {
+					$original_thumbnail_id = (int) $meta['value'];
+					if ( $original_thumbnail_id && isset( $this->processed_posts[ $original_thumbnail_id ] ) ) {
+						$meta['value'] = $this->processed_posts[ $original_thumbnail_id ];
+					} else {
+						$this->topological_skip_entity( $skip_metadata );
+						$this->save_cursor();
+						return;
+					}
+				}
+
+				if ( 'nav_menu_item' === $this->stream_cursor['current_post_type'] ) {
+					$menu_item_original_id = $this->stream_cursor['current_post_original_id'];
+					if ( '_menu_item_type' === $meta['key'] && $menu_item_original_id ) {
+						$this->menu_item_types[ $menu_item_original_id ] = $meta['value'];
+					}
+
+					if ( '_menu_item_object_id' === $meta['key'] ) {
+						$menu_item_type = $menu_item_original_id && isset( $this->menu_item_types[ $menu_item_original_id ] )
+							? $this->menu_item_types[ $menu_item_original_id ]
+							: null;
+
+						if ( ! $menu_item_type ) {
+							$this->topological_skip_entity( $skip_metadata );
+							$this->save_cursor();
+							return;
+						}
+
+						if ( 'taxonomy' === $menu_item_type ) {
+							$original_term_id = (int) $meta['value'];
+							if ( $original_term_id && isset( $this->processed_terms[ $original_term_id ] ) ) {
+								$meta['value'] = $this->processed_terms[ $original_term_id ];
+							} else {
+								$this->topological_skip_entity( $skip_metadata );
+								$this->save_cursor();
+								return;
+							}
+						} elseif ( 'post_type' === $menu_item_type ) {
+							$original_post_id = (int) $meta['value'];
+							if ( $original_post_id && isset( $this->processed_posts[ $original_post_id ] ) ) {
+								$meta['value'] = $this->processed_posts[ $original_post_id ];
+							} else {
+								$this->topological_skip_entity( $skip_metadata );
+								$this->save_cursor();
+								return;
+							}
+						}
+					}
+
+					if ( '_menu_item_menu_item_parent' === $meta['key'] ) {
+						$original_parent_id = (int) $meta['value'];
+						if ( $original_parent_id > 0 ) {
+							if ( isset( $this->processed_menu_items[ $original_parent_id ] ) ) {
+								$meta['value'] = $this->processed_menu_items[ $original_parent_id ];
+							} else {
+								$this->topological_skip_entity( $skip_metadata );
+								$this->save_cursor();
+								return;
+							}
+						}
+					}
+				}
+
 				$this->process_post_meta( $meta, $this->stream_cursor['current_post_id'] );
 				break;
 
 			case 'comment':
+				if ( ! empty( $this->stream_cursor['skipping_post_entities'] ) ) {
+					$this->topological_skip_entity();
+					$this->save_cursor();
+					return;
+				}
+
 				if ( empty( $this->stream_cursor['current_post_id'] ) ) {
-					var_dump(' skipping comment: no current post id ');
 					break;
 				}
 
 				$original_comment_id = isset( $data['comment_id'] ) ? intval( $data['comment_id'] ) : null;
 				$comment_parent      = isset( $data['comment_parent'] ) ? (int) $data['comment_parent'] : 0;
 				if ( $comment_parent > 0 && ! isset( $this->processed_comments[ $comment_parent ] ) ) {
-					var_dump(' topologically skipping comment: ' . $original_comment_id . ' (parent: ' . $comment_parent . ')');
-					var_dump(['processed_comments' => $this->processed_comments]);
 					$this->topological_skip_entity( array(
 						'current_post_id'         => $this->stream_cursor['current_post_id'],
 						'current_comment_post_id' => $this->stream_cursor['current_comment_post_id'],
 						'current_post_exists'     => $this->stream_cursor['current_post_exists'],
+						'current_post_type'       => $this->stream_cursor['current_post_type'],
+						'current_post_original_id' => $this->stream_cursor['current_post_original_id'],
 					) );
 					// Make sure the following meta won't be associated with this comment
 					$this->stream_cursor['last_comment_id'] = null;
+					$this->save_cursor();
 					return;
 				}
 
@@ -849,8 +971,6 @@ class WP_Import extends WP_Importer {
 					'comment_parent'       => $comment_parent > 0 ? $this->processed_comments[ $comment_parent ] : $comment_parent,
 					'commentmeta'          => array(),
 				);
-				var_dump(' processing comment: ' . $original_comment_id . ' (parent: ' . $comment_parent . ')');
-
 				if ( isset( $data['comment_user_id'] ) && isset( $this->processed_authors[ $data['comment_user_id'] ] ) ) {
 					$comment['user_id'] = $this->processed_authors[ $data['comment_user_id'] ];
 				}
@@ -867,6 +987,7 @@ class WP_Import extends WP_Importer {
 					//        would support 10 million comments without going out of memory.
 					//        E.g. a separate table, an SQLite database, a filesystem-based trie, etc.
 					$this->processed_comments[ $original_comment_id ] = $inserted_comment_id;
+					do_action( 'wp_import_insert_comment', $inserted_comment_id, $comment, $this->stream_cursor['current_comment_post_id'], $this->stream_cursor['post_context']['post'] );
 
 					// The current comment entity may carry some meta entries – let's defer processing
 					// them to the future passes of this loop:
@@ -889,19 +1010,44 @@ class WP_Import extends WP_Importer {
 				break;
 
 			case 'comment_meta':
-				if ( empty( $this->stream_cursor['current_post_id'] ) ) {
-					// TODO: Log something – we just saw a post meta outside of a post context. The
-					//       only thing we can do is skip it.
-					break;
+				if ( ! empty( $this->stream_cursor['skipping_post_entities'] ) ) {
+					$this->topological_skip_entity();
+					$this->save_cursor();
+					return;
 				}
 
 				// No need to use comment mapping – meta entries in WXR do not have an associated comment ID.
 				// They are just defined as children of the `<wp:comment>` element.
-				$applied_comment_id = isset( $data['comment_id'] ) ? (int) $data['comment_id'] : 0;
-				$meta               = isset( $data['meta'] ) && is_array( $data['meta'] ) ? $data['meta'] : null;
-				if ( $applied_comment_id && $meta && isset( $meta['key'] ) ) {
-					$this->process_post_comment_meta( $applied_comment_id, $meta );
+				$comment_id = isset( $data['comment_id'] ) ? (int) $data['comment_id'] : 0;
+				$meta       = null;
+				if ( isset( $data['meta'] ) && is_array( $data['meta'] ) ) {
+					$meta = $data['meta'];
+				} else {
+					$key = isset( $data['key'] ) ? $data['key'] : ( isset( $data['meta_key'] ) ? $data['meta_key'] : null );
+					if ( $key ) {
+						$meta = array(
+							'key'   => $key,
+							'value' => isset( $data['value'] ) ? $data['value'] : ( isset( $data['meta_value'] ) ? $data['meta_value'] : '' ),
+						);
+					}
 				}
+
+				if ( ! $comment_id || ! $meta || ! isset( $meta['key'] ) ) {
+					break;
+				}
+
+				$applied_comment_id = $comment_id;
+				if ( ! isset( $data['meta'] ) ) {
+					if ( isset( $this->processed_comments[ $comment_id ] ) ) {
+						$applied_comment_id = $this->processed_comments[ $comment_id ];
+					} else {
+						$this->topological_skip_entity();
+						$this->save_cursor();
+						return;
+					}
+				}
+
+				$this->process_post_comment_meta( $applied_comment_id, $meta );
 				break;
 
 			default:
@@ -913,6 +1059,7 @@ class WP_Import extends WP_Importer {
 				break;
 		}
 
+		$this->save_cursor();
 		return true;
 	}
 
@@ -957,7 +1104,6 @@ class WP_Import extends WP_Importer {
 
 	private function topologically_unskip_entity() {
 		$entity_index = $this->stream_cursor['last_entity_index'];
-		var_dump(' topologically unskipping entity: ' . $entity_index);
 		$ranges = &$this->topologically_skipped_ranges;
 
 		for ( $i = 0; $i < count( $ranges ); $i++ ) {
@@ -1048,10 +1194,14 @@ class WP_Import extends WP_Importer {
 			'stream_cursor' => $this->stream_cursor,
 			'first_full_run_done' => $this->first_full_run_done,
 			'topologically_skipped_before' => $this->topologically_skipped_before,
+			'topologically_skipped_ranges' => $this->topologically_skipped_ranges,
+			'menu_item_types' => $this->menu_item_types,
+			'frontloading_done' => $this->frontloading_done,
+			'frontload_cursor' => $this->frontload_cursor,
 		) ) );
 	}
 
-	private function restore_from_last_cursor() {
+	private function restore_from_last_cursor( $expected_import_file = null ) {
 		$last_cursor = get_option( 'wp_import_cursor' );
 		if ( false === $last_cursor ) {
 			$this->initialize_empty_stream_cursor();
@@ -1063,7 +1213,12 @@ class WP_Import extends WP_Importer {
 			return false;
 		}
 
-		$this->version = $last_cursor['version'];
+		if ( null !== $expected_import_file && isset( $last_cursor['import_file'] ) && $last_cursor['import_file'] !== $expected_import_file ) {
+			$this->initialize_empty_stream_cursor();
+			return false;
+		}
+
+		$this->version  = $last_cursor['version'];
 		$this->base_url = $last_cursor['base_url'];
 
 		$this->processed_authors = $last_cursor['processed_authors'];
@@ -1078,9 +1233,13 @@ class WP_Import extends WP_Importer {
 		$this->fetch_attachments = $last_cursor['fetch_attachments'];
 		$this->options = $last_cursor['options'];
 		$this->import_file = $last_cursor['import_file'];
-		$this->stream_cursor = $last_cursor['stream_cursor'];
-		$this->first_full_run_done = $last_cursor['first_full_run_done'];
+		$this->stream_cursor                = $last_cursor['stream_cursor'];
+		$this->first_full_run_done          = $last_cursor['first_full_run_done'];
 		$this->topologically_skipped_before = $last_cursor['topologically_skipped_before'];
+		$this->topologically_skipped_ranges = isset( $last_cursor['topologically_skipped_ranges'] ) ? $last_cursor['topologically_skipped_ranges'] : array();
+		$this->menu_item_types              = isset( $last_cursor['menu_item_types'] ) ? $last_cursor['menu_item_types'] : array();
+		$this->frontloading_done            = isset( $last_cursor['frontloading_done'] ) ? (bool) $last_cursor['frontloading_done'] : false;
+		$this->frontload_cursor             = isset( $last_cursor['frontload_cursor'] ) ? $last_cursor['frontload_cursor'] : null;
 		return true;
 	}
 
@@ -1095,6 +1254,9 @@ class WP_Import extends WP_Importer {
 			'current_post_id'              => null,
 			'current_comment_post_id'      => null,
 			'current_post_exists'          => null,
+			'current_post_type'            => null,
+			'current_post_original_id'     => null,
+			'skipping_post_entities'       => false,
 			'post_context'                 => array(
 				'post'                     => null,
 				'comment_id_map'           => array(),
@@ -1117,6 +1279,9 @@ class WP_Import extends WP_Importer {
 		$this->stream_cursor['current_post_id']         = null;
 		$this->stream_cursor['current_comment_post_id'] = null;
 		$this->stream_cursor['current_post_exists']     = null;
+		$this->stream_cursor['current_post_type']       = null;
+		$this->stream_cursor['current_post_original_id'] = null;
+		$this->stream_cursor['skipping_post_entities']  = false;
 	}
 
 	/**
@@ -1180,6 +1345,127 @@ class WP_Import extends WP_Importer {
 		$postmeta = isset( $post['postmeta'] ) ? $post['postmeta'] : array();
 		$postmeta = apply_filters( 'wp_import_post_meta', $postmeta, $post_id, $post );
 		$this->process_post_metas( $postmeta, $post_id, $post );
+	}
+
+	/**
+	 * Hydrate parsed URL helpers from stored base URLs.
+	 */
+	private function hydrate_url_parsed_state() {
+		if ( $this->base_url && ! $this->base_url_parsed ) {
+			$base_url_with_trailing_slash = rtrim( $this->base_url, '/' ) . '/';
+			$this->base_url_parsed        = WPURL::parse( $base_url_with_trailing_slash );
+		}
+
+		if ( ! $this->site_url_parsed ) {
+			$site_url_with_trailing_slash = rtrim( get_site_url(), '/' ) . '/';
+			$this->site_url_parsed        = WPURL::parse( $site_url_with_trailing_slash );
+		}
+	}
+
+	/**
+	 * Prepares the importer for streaming mode without parsing the full file.
+	 *
+	 * @param string $file Path to the WXR file for importing.
+	 */
+	private function import_start_streaming( $file ) {
+		if ( ! is_file( $file ) ) {
+			echo '<p><strong>' . __( 'Sorry, there has been an error.', 'wordpress-importer' ) . '</strong><br />';
+			echo __( 'The file does not exist, please try again.', 'wordpress-importer' ) . '</p>';
+			$this->footer();
+			die();
+		}
+
+		$this->import_file = $file;
+
+		if ( $this->restore_from_last_cursor( $file ) ) {
+			$this->hydrate_url_parsed_state();
+			wp_defer_term_counting( true );
+			wp_defer_comment_counting( true );
+			do_action( 'import_start' );
+			return;
+		}
+
+		$this->initialize_empty_stream_cursor();
+		$this->topologically_skipped_ranges = array();
+		$this->first_full_run_done          = false;
+		$this->topologically_skipped_before = null;
+		$this->menu_item_types              = array();
+		$this->frontloading_done            = false;
+		$this->frontload_cursor             = null;
+
+		$reader = WXREntityReader::create_for_wordpress_importer( $file );
+		if ( ! $reader ) {
+			echo '<p><strong>' . __( 'Sorry, there has been an error.', 'wordpress-importer' ) . '</strong><br />';
+			echo __( 'Could not initialize the streaming reader.', 'wordpress-importer' ) . '</p>';
+			$this->footer();
+			die();
+		}
+
+		while ( $reader->next_entity() ) {
+			$entity = $reader->get_entity();
+			if ( ! $entity instanceof ImportEntity ) {
+				continue;
+			}
+
+			$data = $entity->get_data();
+			switch ( $entity->get_type() ) {
+				case 'site_option':
+					if ( empty( $data['option_name'] ) ) {
+						break;
+					}
+					if ( 'wxr_version' === $data['option_name'] ) {
+						$this->version = $data['option_value'];
+					} elseif ( 'siteurl' === $data['option_name'] ) {
+						$this->base_url = esc_url( $data['option_value'] );
+					} elseif ( 'home' === $data['option_name'] && empty( $this->base_url ) ) {
+						$this->base_url = esc_url( $data['option_value'] );
+					}
+					break;
+
+				case 'user':
+					if ( empty( $data['user_login'] ) ) {
+						break;
+					}
+					$login = sanitize_user( $data['user_login'], true );
+					$this->authors[ $login ] = array(
+						'author_id'           => isset( $data['author_id'] ) ? $data['author_id'] : null,
+						'author_login'        => $login,
+						'author_email'        => isset( $data['author_email'] ) ? $data['author_email'] : '',
+						'author_display_name' => isset( $data['author_display_name'] ) ? $data['author_display_name'] : $login,
+						'author_first_name'   => isset( $data['author_first_name'] ) ? $data['author_first_name'] : '',
+						'author_last_name'    => isset( $data['author_last_name'] ) ? $data['author_last_name'] : '',
+					);
+					break;
+
+				case 'post':
+					if ( empty( $data['post_author'] ) ) {
+						break;
+					}
+					$login = sanitize_user( $data['post_author'], true );
+					if ( ! $login ) {
+						break;
+					}
+					if ( ! isset( $this->authors[ $login ] ) ) {
+						$this->authors[ $login ] = array(
+							'author_login'        => $login,
+							'author_display_name' => $data['post_author'],
+						);
+					}
+					break;
+
+				default:
+					if ( 'wxr_version' === $entity->get_type() && isset( $data['wxr_version'] ) ) {
+						$this->version = $data['wxr_version'];
+					}
+					break;
+			}
+		}
+
+		$this->hydrate_url_parsed_state();
+
+		wp_defer_term_counting( true );
+		wp_defer_comment_counting( true );
+		do_action( 'import_start' );
 	}
 
 	/**
@@ -2050,9 +2336,12 @@ class WP_Import extends WP_Importer {
 	 * @param array $post            Original post array from the WXR file.
 	 */
 	protected function process_post_comments( $comments, $post_exists, $comment_post_id, $post ) {
+		global $wpdb;
+
 		$num_comments      = 0;
 		$newcomments       = array();
 		$inserted_comments = array();
+		$comment_orphans   = array(); // Track comments whose parent hasn't been inserted yet
 
 		foreach ( $comments as $comment ) {
 			$comment_id = $comment['comment_id'];
@@ -2084,8 +2373,14 @@ class WP_Import extends WP_Importer {
 		ksort( $newcomments );
 
 		foreach ( $newcomments as $key => $comment ) {
-			if ( isset( $inserted_comments[ $comment['comment_parent'] ] ) ) {
-				$comment['comment_parent'] = $inserted_comments[ $comment['comment_parent'] ];
+			$original_parent = $comment['comment_parent'];
+
+			if ( $original_parent && isset( $inserted_comments[ $original_parent ] ) ) {
+				$comment['comment_parent'] = $inserted_comments[ $original_parent ];
+			} elseif ( $original_parent ) {
+				// Parent hasn't been inserted yet - we'll fix this in the second pass
+				$comment['comment_parent'] = 0;
+				$comment_orphans[ $key ] = $original_parent;
 			}
 
 			$inserted_comment_id = $this->process_post_comment( $comment, $post_exists, $comment_post_id );
@@ -2095,6 +2390,20 @@ class WP_Import extends WP_Importer {
 				$this->process_post_comment_metas( $inserted_comment_id, $comment['commentmeta'] );
 				$inserted_comments[ $key ] = $inserted_comment_id;
 				++$num_comments;
+			}
+		}
+
+		// Second pass: fix comment parents for orphans
+		foreach ( $comment_orphans as $child_id => $parent_id ) {
+			if ( isset( $inserted_comments[ $child_id ] ) && isset( $inserted_comments[ $parent_id ] ) ) {
+				$wpdb->update(
+					$wpdb->comments,
+					array( 'comment_parent' => $inserted_comments[ $parent_id ] ),
+					array( 'comment_ID' => $inserted_comments[ $child_id ] ),
+					'%d',
+					'%d'
+				);
+				clean_comment_cache( $inserted_comments[ $child_id ] );
 			}
 		}
 	}
