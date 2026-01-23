@@ -201,5 +201,4 @@ class WXR_Parser_XML_Processor {
 			'version'       => $wxr_version,
 		);
 	}
-
 }
