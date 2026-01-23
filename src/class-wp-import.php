@@ -182,23 +182,23 @@ class WP_Import extends WP_Importer {
 	 * the execution flow explicit and resume-friendly. This bypasses the legacy
 	 * aggregate filters (`wp_import_tags`, `wp_import_posts`, etc.) because they
 	 * require loading the full dataset into memory.
-	 * 
-	 * TODO:
-	 * 
-	 * Stream handling for those properties:
-	 * 
-	 *	public $processed_authors    = array();
-	 *	public $author_mapping       = array();
-	 *	public $processed_terms      = array();
-	 *	public $processed_posts      = array();
-	 *	public $post_orphans         = array();
-	 *	public $processed_menu_items = array();
-	 *	public $menu_item_orphans    = array();
-	 *	public $missing_menu_items   = array();
 	 *
-	 *	public $fetch_attachments = false;
-	 *	public $url_remap         = array();
-	 *	public $featured_images   = array();
+	 * TODO:
+	 *
+	 * Stream handling for those properties:
+	 *
+	 *  public $processed_authors    = array();
+	 *  public $author_mapping       = array();
+	 *  public $processed_terms      = array();
+	 *  public $processed_posts      = array();
+	 *  public $post_orphans         = array();
+	 *  public $processed_menu_items = array();
+	 *  public $menu_item_orphans    = array();
+	 *  public $missing_menu_items   = array();
+	 *
+	 *  public $fetch_attachments = false;
+	 *  public $url_remap         = array();
+	 *  public $featured_images   = array();
 	 *
 	 * Stream handling for $this->get_author_mapping();
 	 *
