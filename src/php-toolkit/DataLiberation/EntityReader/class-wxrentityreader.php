@@ -424,7 +424,7 @@ class WXREntityReader implements EntityReader {
 		);
 	}
 
-	public static function create( ?ByteReadStream $upstream = null, $cursor = null, $options = array() ) {
+	static public function create( ?ByteReadStream $upstream = null, $cursor = null, $options = array() ) {
 		$xml_cursor = null;
 		if ( null !== $cursor ) {
 			$cursor = json_decode( $cursor, true );
