@@ -260,7 +260,7 @@ class WXREntityReader implements EntityReader {
 	 * @param string $file Absolute path to the WXR file.
 	 * @return WXREntityReader|false
 	 */
-	static public function create_for_wordpress_importer( $file ) {
+	public static function create_for_wordpress_importer( $file ) {
 		// Every XML element is a combination of a long-form namespace and a
 		// local element name, e.g. a syntax <wp:post_id> could actually refer
 		// to a (https://wordpress.org/export/1.0/, post_id) element.
