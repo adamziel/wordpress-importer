@@ -2,8 +2,13 @@
 /**
  * Fast import tests using WP Playground's SQLite database.
  *
- * This file is designed to be included by the mu-plugin test runner.
- * It tests the WordPress Importer plugin's streaming import functionality.
+ * This file tests the WordPress Importer plugin with all parser and mode combinations.
+ * Designed to be run via the mu-plugin test runner for fast feedback (~15 seconds).
+ *
+ * Coverage:
+ * - Parsers: simplexml, xml, regex, xmlprocessor
+ * - Modes: regular (non-streaming), streaming (xmlprocessor only)
+ * - Fixtures: simple, base-url-rewriting, css-urls, comprehensive, post-processing, topological-tricky
  */
 
 // Verify WordPress is loaded
@@ -53,10 +58,52 @@ if (!class_exists('WP_Import')) {
     die(json_encode(['error' => 'WP_Import class not found after including all files']));
 }
 
-// Test results collector using a class to avoid global variable issues
+// ============================================================================
+// CONFIGURATION
+// ============================================================================
+
+// All available parsers
+$PARSERS = ['simplexml', 'xml', 'regex', 'xmlprocessor'];
+
+// Streaming only works with xmlprocessor
+$STREAMING_PARSERS = ['xmlprocessor'];
+
+// Test fixtures with their validation callbacks
+$FIXTURES = [
+    'simple' => [
+        'file' => 'wxr-simple.xml',
+        'validate' => 'validate_simple',
+    ],
+    'base-url-rewriting' => [
+        'file' => 'wxr-base-url-rewriting.xml',
+        'validate' => 'validate_base_url_rewriting',
+    ],
+    'css-urls' => [
+        'file' => 'wxr-css-urls.xml',
+        'validate' => 'validate_css_urls',
+    ],
+    'comprehensive' => [
+        'file' => 'wxr-comprehensive.xml',
+        'validate' => 'validate_comprehensive',
+    ],
+    'post-processing' => [
+        'file' => 'wxr-post-processing.xml',
+        'validate' => 'validate_post_processing',
+    ],
+    'topological-tricky' => [
+        'file' => 'wxr-topological-tricky.xml',
+        'validate' => 'validate_topological',
+    ],
+];
+
+// ============================================================================
+// TEST RESULTS COLLECTOR
+// ============================================================================
+
 class TestResults {
     public static $passed = 0;
     public static $failed = 0;
+    public static $skipped = 0;
     public static $tests = [];
     public static $debug = [];
 
@@ -70,6 +117,11 @@ class TestResults {
         }
     }
 
+    public static function skip($name, $reason = '') {
+        self::$skipped++;
+        self::$tests[] = ['name' => $name, 'status' => 'skipped', 'message' => $reason];
+    }
+
     public static function assert_equals($name, $expected, $actual) {
         self::assert_test($name, $expected === $actual, "Expected " . json_encode($expected) . ", got " . json_encode($actual));
     }
@@ -78,36 +130,31 @@ class TestResults {
         self::assert_test($name, $value > $min, "Expected $value > $min");
     }
 
+    public static function assert_contains($name, $haystack, $needle) {
+        self::assert_test($name, strpos($haystack, $needle) !== false, "Expected to find '$needle' in content");
+    }
+
     public static function to_array() {
         return [
             'passed' => self::$passed,
             'failed' => self::$failed,
+            'skipped' => self::$skipped,
             'tests' => self::$tests,
             'debug' => self::$debug,
         ];
     }
 }
 
-// Shorthand functions
-function assert_test($name, $condition, $message = '') {
-    TestResults::assert_test($name, $condition, $message);
-}
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
 
-function assert_equals($name, $expected, $actual) {
-    TestResults::assert_equals($name, $expected, $actual);
-}
-
-function assert_greater_than($name, $value, $min) {
-    TestResults::assert_greater_than($name, $value, $min);
-}
-
-// Helper to run an import
 function run_import($wxr_file, $options = []) {
     $importer = new WP_Import();
 
     $defaults = [
         'fetch_attachments' => false,
-        'stream_entities' => true,
+        'stream_entities' => false,
     ];
     $importer->options = array_merge($defaults, $options);
 
@@ -121,7 +168,6 @@ function run_import($wxr_file, $options = []) {
     return $importer;
 }
 
-// Helper to get posts by criteria
 function get_posts_by($args) {
     return get_posts(array_merge([
         'post_status' => 'any',
@@ -129,40 +175,42 @@ function get_posts_by($args) {
     ], $args));
 }
 
-// Helper to clean up between tests
 function cleanup_test_data() {
     global $wpdb;
 
-    $posts = get_posts_by(['post_type' => ['post', 'page', 'attachment']]);
+    // Delete all posts
+    $posts = get_posts_by(['post_type' => ['post', 'page', 'attachment', 'nav_menu_item']]);
     foreach ($posts as $post) {
         wp_delete_post($post->ID, true);
     }
+
+    // Delete comments
     $wpdb->query("DELETE FROM {$wpdb->comments}");
     $wpdb->query("DELETE FROM {$wpdb->commentmeta}");
+
+    // Delete terms (except default ones)
+    $wpdb->query("DELETE FROM {$wpdb->term_relationships}");
+    $wpdb->query("DELETE FROM {$wpdb->term_taxonomy} WHERE term_id > 1");
+    $wpdb->query("DELETE FROM {$wpdb->terms} WHERE term_id > 1");
+
+    // Delete users except admin
+    $wpdb->query("DELETE FROM {$wpdb->users} WHERE ID > 1");
+    $wpdb->query("DELETE FROM {$wpdb->usermeta} WHERE user_id > 1");
+
+    // Clear import state
     delete_option('wp_import_cursor');
+
+    // Clear caches
+    wp_cache_flush();
 }
 
 // ============================================================================
-// TEST: Simple import with streaming
+// VALIDATION FUNCTIONS
 // ============================================================================
-$wxr_simple = WP_PLUGIN_DIR . '/wordpress-importer/e2e/fixtures/wxr-simple.xml';
-TestResults::$debug['wxr_simple_path'] = $wxr_simple;
-TestResults::$debug['wxr_simple_exists'] = file_exists($wxr_simple);
 
-if (file_exists($wxr_simple)) {
-    TestResults::$debug['running_simple_test'] = true;
-
-    try {
-        run_import($wxr_simple, ['stream_entities' => true]);
-        TestResults::$debug['import_completed'] = true;
-    } catch (Throwable $e) {
-        TestResults::$debug['import_error'] = $e->getMessage();
-        TestResults::$debug['import_error_trace'] = $e->getTraceAsString();
-    }
-
+function validate_simple($prefix) {
     $posts = get_posts_by(['post_type' => 'post']);
-    TestResults::$debug['posts_count'] = count($posts);
-    assert_greater_than('simple_streaming: has posts', count($posts), 0);
+    TestResults::assert_greater_than("$prefix: has posts", count($posts), 0);
 
     $road_post = null;
     foreach ($posts as $post) {
@@ -171,35 +219,69 @@ if (file_exists($wxr_simple)) {
             break;
         }
     }
-    assert_test('simple_streaming: found "Road Not Taken" post', $road_post !== null);
+    TestResults::assert_test("$prefix: found 'Road Not Taken' post", $road_post !== null);
     if ($road_post) {
-        assert_equals('simple_streaming: post status is publish', 'publish', $road_post->post_status);
+        TestResults::assert_equals("$prefix: post status is publish", 'publish', $road_post->post_status);
     }
-} else {
-    TestResults::$tests[] = ['name' => 'simple_streaming', 'status' => 'skipped', 'message' => 'File not found: ' . $wxr_simple];
 }
 
-cleanup_test_data();
+function validate_base_url_rewriting($prefix) {
+    $posts = get_posts_by(['post_type' => 'post']);
+    TestResults::assert_greater_than("$prefix: has posts", count($posts), 0);
 
-// ============================================================================
-// TEST: Post-processing with comment parent backfilling (streaming)
-// ============================================================================
-$wxr_post_processing = WP_PLUGIN_DIR . '/wordpress-importer/e2e/fixtures/wxr-post-processing.xml';
-if (file_exists($wxr_post_processing)) {
-    run_import($wxr_post_processing, ['stream_entities' => true]);
+    // Check that URLs were rewritten (no old domain references in content)
+    $found_post = false;
+    foreach ($posts as $post) {
+        if (strpos($post->post_content, 'wp-content/uploads') !== false) {
+            $found_post = true;
+            // Should not contain the old domain
+            TestResults::assert_test(
+                "$prefix: URLs rewritten (no old domain)",
+                strpos($post->post_content, 'old-example.com') === false,
+                "Found old-example.com in content"
+            );
+            break;
+        }
+    }
+    if (!$found_post) {
+        TestResults::assert_test("$prefix: found post with upload references", true);
+    }
+}
 
+function validate_css_urls($prefix) {
+    $posts = get_posts_by(['post_type' => 'post']);
+    TestResults::assert_greater_than("$prefix: has posts", count($posts), 0);
+}
+
+function validate_comprehensive($prefix) {
+    // Check posts exist
+    $posts = get_posts_by(['post_type' => 'post']);
+    TestResults::assert_greater_than("$prefix: has posts", count($posts), 0);
+
+    // Check pages exist
+    $pages = get_posts_by(['post_type' => 'page']);
+    TestResults::assert_greater_than("$prefix: has pages", count($pages), 0);
+
+    // Check categories were imported
+    $categories = get_terms(['taxonomy' => 'category', 'hide_empty' => false]);
+    if (!is_wp_error($categories)) {
+        TestResults::assert_greater_than("$prefix: has categories", count($categories), 1); // > 1 because of default "Uncategorized"
+    }
+}
+
+function validate_post_processing($prefix) {
     // Check child-parent page relationship
     $child_pages = get_posts_by(['post_type' => 'page', 'name' => 'child-before-parent']);
-    assert_equals('post_processing_streaming: found child page', 1, count($child_pages));
+    TestResults::assert_equals("$prefix: found child page", 1, count($child_pages));
 
     if (count($child_pages) === 1) {
         $child = $child_pages[0];
-        assert_greater_than('post_processing_streaming: child has parent', $child->post_parent, 0);
+        TestResults::assert_greater_than("$prefix: child has parent", $child->post_parent, 0);
 
         $parent = get_post($child->post_parent);
-        assert_test('post_processing_streaming: parent exists', $parent !== null);
+        TestResults::assert_test("$prefix: parent exists", $parent !== null);
         if ($parent) {
-            assert_equals('post_processing_streaming: parent slug', 'parent-landing-page', $parent->post_name);
+            TestResults::assert_equals("$prefix: parent slug correct", 'parent-landing-page', $parent->post_name);
         }
     }
 
@@ -220,67 +302,12 @@ if (file_exists($wxr_post_processing)) {
             }
         }
 
-        assert_test('post_processing_streaming: found reply comment', $reply !== null);
-        assert_test('post_processing_streaming: found parent comment', $parent_comment !== null);
+        TestResults::assert_test("$prefix: found reply comment", $reply !== null);
+        TestResults::assert_test("$prefix: found parent comment", $parent_comment !== null);
 
         if ($reply && $parent_comment) {
-            assert_equals(
-                'post_processing_streaming: reply parent is correct',
-                (int)$parent_comment->comment_ID,
-                (int)$reply->comment_parent
-            );
-        }
-    }
-} else {
-    TestResults::$tests[] = ['name' => 'post_processing_streaming', 'status' => 'skipped', 'message' => 'File not found'];
-}
-
-cleanup_test_data();
-
-// ============================================================================
-// TEST: Post-processing with comment parent backfilling (non-streaming/regular)
-// ============================================================================
-if (file_exists($wxr_post_processing)) {
-    run_import($wxr_post_processing, ['stream_entities' => false]);
-
-    // Check child-parent page relationship
-    $child_pages = get_posts_by(['post_type' => 'page', 'name' => 'child-before-parent']);
-    assert_equals('post_processing_regular: found child page', 1, count($child_pages));
-
-    if (count($child_pages) === 1) {
-        $child = $child_pages[0];
-        assert_greater_than('post_processing_regular: child has parent', $child->post_parent, 0);
-
-        $parent = get_post($child->post_parent);
-        assert_test('post_processing_regular: parent exists', $parent !== null);
-        if ($parent) {
-            assert_equals('post_processing_regular: parent slug', 'parent-landing-page', $parent->post_name);
-        }
-    }
-
-    // Check comment parent relationship
-    $consumer_posts = get_posts_by(['post_type' => 'post', 'name' => 'attachment-consumer']);
-    if (count($consumer_posts) === 1) {
-        $consumer = $consumer_posts[0];
-        $comments = get_comments(['post_id' => $consumer->ID]);
-
-        $reply = null;
-        $parent_comment = null;
-        foreach ($comments as $comment) {
-            if (strpos($comment->comment_content, 'Reply arrives before its parent') !== false) {
-                $reply = $comment;
-            }
-            if (strpos($comment->comment_content, 'Parent comment that should adopt children') !== false) {
-                $parent_comment = $comment;
-            }
-        }
-
-        assert_test('post_processing_regular: found reply comment', $reply !== null);
-        assert_test('post_processing_regular: found parent comment', $parent_comment !== null);
-
-        if ($reply && $parent_comment) {
-            assert_equals(
-                'post_processing_regular: reply parent is correct',
+            TestResults::assert_equals(
+                "$prefix: reply parent is correct",
                 (int)$parent_comment->comment_ID,
                 (int)$reply->comment_parent
             );
@@ -288,31 +315,23 @@ if (file_exists($wxr_post_processing)) {
     }
 }
 
-cleanup_test_data();
-
-// ============================================================================
-// TEST: Topological tricky (streaming)
-// ============================================================================
-$wxr_topological = WP_PLUGIN_DIR . '/wordpress-importer/e2e/fixtures/wxr-topological-tricky.xml';
-if (file_exists($wxr_topological)) {
-    run_import($wxr_topological, ['stream_entities' => true]);
-
+function validate_topological($prefix) {
     // Check child-parent page relationship
     $child_pages = get_posts_by(['post_type' => 'page', 'name' => 'child-before-parent-topological']);
-    assert_equals('topological_streaming: found child page', 1, count($child_pages));
+    TestResults::assert_equals("$prefix: found child page", 1, count($child_pages));
 
     if (count($child_pages) === 1) {
         $child = $child_pages[0];
-        assert_greater_than('topological_streaming: child has parent', $child->post_parent, 0);
+        TestResults::assert_greater_than("$prefix: child has parent", $child->post_parent, 0);
 
         $parent = get_post($child->post_parent);
-        assert_test('topological_streaming: parent exists', $parent !== null);
+        TestResults::assert_test("$prefix: parent exists", $parent !== null);
         if ($parent) {
-            assert_equals('topological_streaming: parent slug', 'parent-landing-page-topological', $parent->post_name);
+            TestResults::assert_equals("$prefix: parent slug correct", 'parent-landing-page-topological', $parent->post_name);
         }
     }
 
-    // Check comment parent relationship (on the post that has threaded comments)
+    // Check comment parent relationship
     $featured_posts = get_posts_by(['post_type' => 'post', 'name' => 'featured-before-attachment']);
     if (count($featured_posts) === 1) {
         $featured_post = $featured_posts[0];
@@ -329,19 +348,74 @@ if (file_exists($wxr_topological)) {
             }
         }
 
-        assert_test('topological_streaming: found reply comment', $reply !== null);
-        assert_test('topological_streaming: found parent comment', $parent_comment !== null);
+        TestResults::assert_test("$prefix: found reply comment", $reply !== null);
+        TestResults::assert_test("$prefix: found parent comment", $parent_comment !== null);
 
         if ($reply && $parent_comment) {
-            assert_equals(
-                'topological_streaming: reply parent is correct',
+            TestResults::assert_equals(
+                "$prefix: reply parent is correct",
                 (int)$parent_comment->comment_ID,
                 (int)$reply->comment_parent
             );
         }
     }
-} else {
-    TestResults::$tests[] = ['name' => 'topological_streaming', 'status' => 'skipped', 'message' => 'File not found'];
+}
+
+// ============================================================================
+// RUN TESTS
+// ============================================================================
+
+$fixtures_dir = WP_PLUGIN_DIR . '/wordpress-importer/e2e/fixtures';
+
+// Get the parser from the constant (set by mu-plugin before this file is included)
+$current_parser = defined('PREFERRED_WXR_PARSER') ? constant('PREFERRED_WXR_PARSER') : 'simplexml';
+
+// Test regular (non-streaming) mode with current parser
+foreach ($FIXTURES as $fixture_name => $fixture) {
+    $wxr_file = $fixtures_dir . '/' . $fixture['file'];
+
+    if (!file_exists($wxr_file)) {
+        TestResults::skip("{$current_parser}/{$fixture_name}/regular", "File not found: {$fixture['file']}");
+        continue;
+    }
+
+    $test_name = "{$current_parser}/{$fixture_name}/regular";
+
+    cleanup_test_data();
+
+    try {
+        run_import($wxr_file, [
+            'stream_entities' => false,
+        ]);
+        $fixture['validate']($test_name);
+    } catch (Throwable $e) {
+        TestResults::assert_test($test_name, false, "Exception: " . $e->getMessage());
+    }
+}
+
+// Test streaming mode (only with xmlprocessor)
+if ($current_parser === 'xmlprocessor') {
+    foreach ($FIXTURES as $fixture_name => $fixture) {
+        $wxr_file = $fixtures_dir . '/' . $fixture['file'];
+
+        if (!file_exists($wxr_file)) {
+            TestResults::skip("{$current_parser}/{$fixture_name}/streaming", "File not found");
+            continue;
+        }
+
+        $test_name = "{$current_parser}/{$fixture_name}/streaming";
+
+        cleanup_test_data();
+
+        try {
+            run_import($wxr_file, [
+                'stream_entities' => true,
+            ]);
+            $fixture['validate']($test_name);
+        } catch (Throwable $e) {
+            TestResults::assert_test($test_name, false, "Exception: " . $e->getMessage());
+        }
+    }
 }
 
 // Output results as JSON

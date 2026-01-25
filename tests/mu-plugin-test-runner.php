@@ -19,6 +19,14 @@ function run_import_tests_endpoint() {
 
     header('Content-Type: application/json');
 
+    // Get parser from query string
+    $parser = isset($_GET['parser']) ? sanitize_text_field($_GET['parser']) : 'simplexml';
+
+    // Define the parser constant before loading tests
+    if (!defined('PREFERRED_WXR_PARSER')) {
+        define('PREFERRED_WXR_PARSER', $parser);
+    }
+
     try {
         // Include the test file
         $test_file = WP_PLUGIN_DIR . '/wordpress-importer/tests/run-import-tests.php';
