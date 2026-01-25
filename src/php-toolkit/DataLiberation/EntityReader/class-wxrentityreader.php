@@ -258,9 +258,10 @@ class WXREntityReader implements EntityReader {
 	 * WP_Import class from the WordPress Importer plugin.
 	 *
 	 * @param string $file Absolute path to the WXR file.
+	 * @param array|null $cursor
 	 * @return WXREntityReader|false
 	 */
-	static public function create_for_wordpress_importer( $file ) {
+	static public function create_for_wordpress_importer( $file, $cursor = null ) {
 		// Every XML element is a combination of a long-form namespace and a
 		// local element name, e.g. a syntax <wp:post_id> could actually refer
 		// to a (https://wordpress.org/export/1.0/, post_id) element.
@@ -414,7 +415,7 @@ class WXREntityReader implements EntityReader {
 		}
 		return self::create(
 			FileReadStream::from_path( $file ),
-			null,
+			$cursor,
 			array(
 				'known_site_options'        => $known_site_options,
 				'known_entities'            => $known_entities,

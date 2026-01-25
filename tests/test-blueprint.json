@@ -1,0 +1,18 @@
+{
+	"$schema": "https://playground.wordpress.net/blueprint-schema.json",
+	"steps": [
+		{
+			"step": "activatePlugin",
+			"pluginPath": "/wordpress/wp-content/plugins/wordpress-importer"
+		},
+		{
+			"step": "runPHP",
+			"code": "<?php require '/wordpress/wp-content/plugins/wordpress-importer/tests/run-import-tests.php';"
+		},
+		{
+			"step": "writeFile",
+			"path": "/wordpress/test-complete.txt",
+			"data": "done"
+		}
+	]
+}

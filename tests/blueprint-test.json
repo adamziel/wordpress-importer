@@ -1,0 +1,8 @@
+{
+	"steps": [
+		{
+			"step": "runPHP",
+			"code": "<?php echo json_encode(['works' => true, 'wp_loaded' => defined('ABSPATH')]);"
+		}
+	]
+}
