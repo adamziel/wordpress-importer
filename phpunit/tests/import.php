@@ -408,4 +408,282 @@ class Tests_Import_Import extends WP_Import_UnitTestCase {
 			),
 		);
 	}
+
+	/**
+	 * @covers WP_Import::extract_image_urls_from_content
+	 */
+	public function test_extract_image_urls_finds_img_src() {
+		$importer           = new WP_Import();
+		$importer->base_url = 'https://old-site.example.com';
+
+		$content = '<p>Hello</p><img src="https://old-site.example.com/photo.jpg" alt="photo" />';
+		$urls    = $importer->extract_image_urls_from_content( $content );
+
+		$this->assertContains( 'https://old-site.example.com/photo.jpg', $urls );
+	}
+
+	/**
+	 * @covers WP_Import::extract_image_urls_from_content
+	 */
+	public function test_extract_image_urls_finds_css_background_image() {
+		$importer           = new WP_Import();
+		$importer->base_url = 'https://old-site.example.com';
+
+		$content = '<div style="background-image: url(https://old-site.example.com/hero.png)">text</div>';
+		$urls    = $importer->extract_image_urls_from_content( $content );
+
+		$this->assertContains( 'https://old-site.example.com/hero.png', $urls );
+	}
+
+	/**
+	 * @covers WP_Import::extract_image_urls_from_content
+	 */
+	public function test_extract_image_urls_finds_css_background_shorthand() {
+		$importer           = new WP_Import();
+		$importer->base_url = 'https://old-site.example.com';
+
+		$content = '<div style="background: url(https://old-site.example.com/bg.jpg) center / cover no-repeat">text</div>';
+		$urls    = $importer->extract_image_urls_from_content( $content );
+
+		$this->assertContains( 'https://old-site.example.com/bg.jpg', $urls );
+	}
+
+	/**
+	 * CSS url() in a non-background property like cursor should NOT be extracted.
+	 *
+	 * @covers WP_Import::extract_image_urls_from_content
+	 */
+	public function test_extract_image_urls_ignores_non_background_css_url() {
+		$importer           = new WP_Import();
+		$importer->base_url = 'https://old-site.example.com';
+
+		$content = '<div style="cursor: url(https://old-site.example.com/cursor.cur), auto">text</div>';
+		$urls    = $importer->extract_image_urls_from_content( $content );
+
+		$this->assertNotContains( 'https://old-site.example.com/cursor.cur', $urls );
+	}
+
+	/**
+	 * @covers WP_Import::extract_image_urls_from_content
+	 */
+	public function test_extract_image_urls_ignores_css_data_uri() {
+		$importer           = new WP_Import();
+		$importer->base_url = 'https://old-site.example.com';
+
+		$content = '<div style="background-image: url(data:image/png;base64,iVBOR)">text</div>';
+		$urls    = $importer->extract_image_urls_from_content( $content );
+
+		$this->assertEmpty( $urls );
+	}
+
+	/**
+	 * @covers WP_Import::extract_image_urls_from_content
+	 */
+	public function test_extract_image_urls_finds_block_image_attribute() {
+		$importer           = new WP_Import();
+		$importer->base_url = 'https://old-site.example.com';
+
+		$content = '<!-- wp:image {"url":"https://old-site.example.com/block-photo.jpg"} -->'
+			. '<figure class="wp-block-image"><img src="https://old-site.example.com/block-photo.jpg" alt=""/></figure>'
+			. '<!-- /wp:image -->';
+		$urls    = $importer->extract_image_urls_from_content( $content );
+
+		$this->assertContains( 'https://old-site.example.com/block-photo.jpg', $urls );
+	}
+
+	/**
+	 * Links (<a href>) should NOT be treated as image URLs.
+	 *
+	 * @covers WP_Import::extract_image_urls_from_content
+	 */
+	public function test_extract_image_urls_ignores_links() {
+		$importer           = new WP_Import();
+		$importer->base_url = 'https://old-site.example.com';
+
+		$content = '<p><a href="https://old-site.example.com/page">Click here</a></p>';
+		$urls    = $importer->extract_image_urls_from_content( $content );
+
+		$this->assertNotContains( 'https://old-site.example.com/page', $urls );
+	}
+
+	/**
+	 * @covers WP_Import::extract_image_urls_from_content
+	 */
+	public function test_extract_image_urls_resolves_relative_src() {
+		$importer           = new WP_Import();
+		$importer->base_url = 'https://old-site.example.com';
+
+		$content = '<img src="/images/relative.jpg" alt="" />';
+		$urls    = $importer->extract_image_urls_from_content( $content );
+
+		$this->assertContains( 'https://old-site.example.com/images/relative.jpg', $urls );
+	}
+
+	/**
+	 * @covers WP_Import::extract_image_urls_from_content
+	 */
+	public function test_extract_image_urls_deduplicates() {
+		$importer           = new WP_Import();
+		$importer->base_url = 'https://old-site.example.com';
+
+		// Same image URL used twice: in block attribute and in <img> tag.
+		$content = '<!-- wp:image {"url":"https://old-site.example.com/photo.jpg"} -->'
+			. '<figure class="wp-block-image"><img src="https://old-site.example.com/photo.jpg" alt=""/></figure>'
+			. '<!-- /wp:image -->';
+		$urls    = $importer->extract_image_urls_from_content( $content );
+
+		$this->assertCount( 1, $urls );
+		$this->assertContains( 'https://old-site.example.com/photo.jpg', $urls );
+	}
+
+	/**
+	 * Integration test: import a WXR with no attachment posts and verify that
+	 * linked images are downloaded and post content is updated.
+	 *
+	 * @covers WP_Import::process_linked_images
+	 */
+	public function test_download_linked_images_creates_attachments_and_remaps_urls() {
+		$this->previous_uploads_structure = get_option( 'uploads_use_yearmonth_folders', true );
+		update_option( 'uploads_use_yearmonth_folders', 0 );
+
+		// Minimal valid JPEG bytes for the mock.
+		$image_bytes = base64_decode(
+			'/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////2wBDAf//////////////////////////////////////////////////////////////////////////////////////wAARCABkAGQDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAX/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIQAxAAAAF//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPwB//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPwB//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAwEBPwB//9k',
+			true
+		);
+
+		// Mock HTTP responses for both image URLs in the test fixture.
+		$mock_urls = array(
+			'https://old-site.example.com/images/photo.jpg',
+			'https://old-site.example.com/images/hero.png',
+			'https://old-site.example.com/images/block-photo.jpg',
+		);
+
+		$mock_callback = function ( $preempt, $parsed_args, $url ) use ( $mock_urls, $image_bytes ) {
+			if ( ! in_array( $url, $mock_urls, true ) ) {
+				return $preempt;
+			}
+			if ( empty( $parsed_args['filename'] ) ) {
+				return $preempt;
+			}
+
+			file_put_contents( $parsed_args['filename'], $image_bytes );
+
+			// Derive content-type from the URL extension.
+			$ext          = pathinfo( parse_url( $url, PHP_URL_PATH ), PATHINFO_EXTENSION );
+			$content_type = 'png' === $ext ? 'image/png' : 'image/jpeg';
+
+			return array(
+				'headers'  => array(
+					'content-length' => (string) strlen( $image_bytes ),
+					'content-type'   => $content_type,
+				),
+				'body'     => '',
+				'response' => array(
+					'code'    => 200,
+					'message' => 'OK',
+				),
+			);
+		};
+
+		add_filter( 'pre_http_request', $mock_callback, 10, 3 );
+
+		try {
+			$importer = new WP_Import();
+			$file     = realpath( DIR_TESTDATA_WP_IMPORTER . '/wxr-linked-images.xml' );
+
+			$_POST = array(
+				'imported_authors' => array( 0 => 'admin' ),
+				'user_map'         => array(),
+				'user_new'         => array(),
+			);
+
+			ob_start();
+			$importer->fetch_attachments      = false;
+			$importer->download_linked_images = true;
+			$importer->import( $file, array(
+				'rewrite_urls'           => false,
+				'download_linked_images' => true,
+			) );
+			ob_end_clean();
+
+			$_POST = array();
+		} finally {
+			remove_filter( 'pre_http_request', $mock_callback, 10 );
+		}
+
+		// Verify attachment posts were created for the linked images.
+		$attachments = get_posts( array(
+			'numberposts' => -1,
+			'post_type'   => 'attachment',
+			'post_status' => 'inherit',
+		) );
+		$this->assertGreaterThanOrEqual( 2, count( $attachments ), 'Expected at least 2 attachment posts for downloaded linked images.' );
+
+		// Verify that the downloaded images exist on disk.
+		foreach ( $attachments as $attachment ) {
+			$attached_file = get_attached_file( $attachment->ID );
+			$this->assertFileExists( $attached_file );
+		}
+
+		// Verify that post content was updated to reference local URLs.
+		$posts = get_posts( array(
+			'post_type'   => 'post',
+			'post_status' => 'any',
+			'numberposts' => -1,
+		) );
+		$this->assertCount( 2, $posts, 'Expected 2 posts to be imported.' );
+
+		foreach ( $posts as $post ) {
+			$this->assertStringNotContainsString(
+				'old-site.example.com/images/',
+				$post->post_content,
+				'Post content should no longer reference the old site image URLs after backfill.'
+			);
+		}
+	}
+
+	/**
+	 * When download_linked_images is off, no extra attachments should be created.
+	 *
+	 * @covers WP_Import::process_linked_images
+	 */
+	public function test_download_linked_images_disabled_by_default() {
+		$importer = new WP_Import();
+		$file     = realpath( DIR_TESTDATA_WP_IMPORTER . '/wxr-linked-images.xml' );
+
+		$_POST = array(
+			'imported_authors' => array( 0 => 'admin' ),
+			'user_map'         => array(),
+			'user_new'         => array(),
+		);
+
+		ob_start();
+		$importer->fetch_attachments = false;
+		$importer->import( $file, array( 'rewrite_urls' => false ) );
+		ob_end_clean();
+
+		$_POST = array();
+
+		$attachments = get_posts( array(
+			'numberposts' => -1,
+			'post_type'   => 'attachment',
+			'post_status' => 'inherit',
+		) );
+		$this->assertCount( 0, $attachments, 'No attachments should be created when download_linked_images is disabled.' );
+
+		// Original image URLs should still be in the content.
+		$post = get_posts( array(
+			'post_type'   => 'post',
+			'post_status' => 'any',
+			'numberposts' => 1,
+			'orderby'     => 'ID',
+			'order'       => 'ASC',
+		) );
+		$this->assertStringContainsString(
+			'old-site.example.com/images/photo.jpg',
+			$post[0]->post_content,
+			'Original image URLs should remain when download is disabled.'
+		);
+	}
 }
