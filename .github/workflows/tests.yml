@@ -41,15 +41,6 @@ jobs:
           - php: '8.3'
             wp: '6.4'
             experimental: false
-          # PHP 8.2 is beta-supported since WP 6.1 and Requests was updated in WP 6.2.
-          # That means that WP 6.2 is the earliest WP version which can be used with PHP 8.1 for this plugin.
-          # WP latest now uses PHP 8.3 typed constants, so PHP 8.2 builds are experimental.
-          - php: '8.2'
-            wp: 'latest'
-            experimental: true
-          - php: '8.2'
-            wp: '6.2'
-            experimental: true
           # PHP 8.1 is beta-supported since WP 5.9 and Requests was updated in WP 6.2.
           # That means that WP 6.2 is the earliest WP version which can be used with PHP 8.1 for this plugin.
           - php: '8.1'
