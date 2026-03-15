@@ -1880,11 +1880,11 @@ class WP_Import extends WP_Importer {
 			$fetch_url = $parsed_fetch_url->href;
 
 			$post = array(
-				'post_title'   => '',
-				'post_status'  => 'inherit',
-				'post_type'    => 'attachment',
-				'upload_date'  => '',
-				'guid'         => $fetch_url,
+				'post_title'  => '',
+				'post_status' => 'inherit',
+				'post_type'   => 'attachment',
+				'upload_date' => '',
+				'guid'        => $fetch_url,
 			);
 
 			$upload = $this->fetch_remote_file( $fetch_url, $post );
@@ -1913,8 +1913,8 @@ class WP_Import extends WP_Importer {
 			}
 
 			$post['post_mime_type'] = $info['type'];
-			$post['guid']          = $upload['url'];
-			$post['post_title']    = pathinfo( $upload['file'], PATHINFO_FILENAME );
+			$post['guid']           = $upload['url'];
+			$post['post_title']     = pathinfo( $upload['file'], PATHINFO_FILENAME );
 
 			$post_id = wp_insert_attachment( $post, $upload['file'] );
 			wp_update_attachment_metadata( $post_id, wp_generate_attachment_metadata( $post_id, $upload['file'] ) );

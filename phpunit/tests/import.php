@@ -625,10 +625,13 @@ class Tests_Import_Import extends WP_Import_UnitTestCase {
 			ob_start();
 			$importer->fetch_attachments      = false;
 			$importer->download_linked_images = true;
-			$importer->import( $file, array(
-				'rewrite_urls'           => false,
-				'download_linked_images' => true,
-			) );
+			$importer->import(
+				$file,
+				array(
+					'rewrite_urls'           => false,
+					'download_linked_images' => true,
+				)
+			);
 			ob_end_clean();
 
 			$_POST = array();
@@ -637,11 +640,13 @@ class Tests_Import_Import extends WP_Import_UnitTestCase {
 		}
 
 		// Verify attachment posts were created for the linked images.
-		$attachments = get_posts( array(
-			'numberposts' => -1,
-			'post_type'   => 'attachment',
-			'post_status' => 'inherit',
-		) );
+		$attachments = get_posts(
+			array(
+				'numberposts' => -1,
+				'post_type'   => 'attachment',
+				'post_status' => 'inherit',
+			)
+		);
 		$this->assertGreaterThanOrEqual( 2, count( $attachments ), 'Expected at least 2 attachment posts for downloaded linked images.' );
 
 		// Verify that the downloaded images exist on disk.
@@ -651,11 +656,13 @@ class Tests_Import_Import extends WP_Import_UnitTestCase {
 		}
 
 		// Verify that post content was updated to reference local URLs.
-		$posts = get_posts( array(
-			'post_type'   => 'post',
-			'post_status' => 'any',
-			'numberposts' => -1,
-		) );
+		$posts = get_posts(
+			array(
+				'post_type'   => 'post',
+				'post_status' => 'any',
+				'numberposts' => -1,
+			)
+		);
 		$this->assertCount( 2, $posts, 'Expected 2 posts to be imported.' );
 
 		foreach ( $posts as $post ) {
@@ -689,21 +696,25 @@ class Tests_Import_Import extends WP_Import_UnitTestCase {
 
 		$_POST = array();
 
-		$attachments = get_posts( array(
-			'numberposts' => -1,
-			'post_type'   => 'attachment',
-			'post_status' => 'inherit',
-		) );
+		$attachments = get_posts(
+			array(
+				'numberposts' => -1,
+				'post_type'   => 'attachment',
+				'post_status' => 'inherit',
+			)
+		);
 		$this->assertCount( 0, $attachments, 'No attachments should be created when download_linked_images is disabled.' );
 
 		// Original image URLs should still be in the content.
-		$post = get_posts( array(
-			'post_type'   => 'post',
-			'post_status' => 'any',
-			'numberposts' => 1,
-			'orderby'     => 'ID',
-			'order'       => 'ASC',
-		) );
+		$post = get_posts(
+			array(
+				'post_type'   => 'post',
+				'post_status' => 'any',
+				'numberposts' => 1,
+				'orderby'     => 'ID',
+				'order'       => 'ASC',
+			)
+		);
 		$this->assertStringContainsString(
 			'old-site.example.com/images/photo.jpg',
 			$post[0]->post_content,
