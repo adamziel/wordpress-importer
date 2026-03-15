@@ -410,9 +410,20 @@ class Tests_Import_Import extends WP_Import_UnitTestCase {
 	}
 
 	/**
+	 * Checks whether the BlockMarkupUrlProcessor is available. It requires
+	 * WP_HTML_Tag_Processor::next_token() which was introduced in WordPress 6.5.
+	 */
+	private function skip_if_block_markup_url_processor_unavailable() {
+		if ( ! method_exists( 'WP_HTML_Tag_Processor', 'next_token' ) ) {
+			$this->markTestSkipped( 'BlockMarkupUrlProcessor requires WP_HTML_Tag_Processor::next_token() (WordPress 6.5+).' );
+		}
+	}
+
+	/**
 	 * @covers WP_Import::extract_image_urls_from_content
 	 */
 	public function test_extract_image_urls_finds_img_src() {
+		$this->skip_if_block_markup_url_processor_unavailable();
 		$importer           = new WP_Import();
 		$importer->base_url = 'https://old-site.example.com';
 
@@ -426,6 +437,7 @@ class Tests_Import_Import extends WP_Import_UnitTestCase {
 	 * @covers WP_Import::extract_image_urls_from_content
 	 */
 	public function test_extract_image_urls_finds_css_background_image() {
+		$this->skip_if_block_markup_url_processor_unavailable();
 		$importer           = new WP_Import();
 		$importer->base_url = 'https://old-site.example.com';
 
@@ -439,6 +451,7 @@ class Tests_Import_Import extends WP_Import_UnitTestCase {
 	 * @covers WP_Import::extract_image_urls_from_content
 	 */
 	public function test_extract_image_urls_finds_css_background_shorthand() {
+		$this->skip_if_block_markup_url_processor_unavailable();
 		$importer           = new WP_Import();
 		$importer->base_url = 'https://old-site.example.com';
 
@@ -454,6 +467,7 @@ class Tests_Import_Import extends WP_Import_UnitTestCase {
 	 * @covers WP_Import::extract_image_urls_from_content
 	 */
 	public function test_extract_image_urls_ignores_non_background_css_url() {
+		$this->skip_if_block_markup_url_processor_unavailable();
 		$importer           = new WP_Import();
 		$importer->base_url = 'https://old-site.example.com';
 
@@ -467,6 +481,7 @@ class Tests_Import_Import extends WP_Import_UnitTestCase {
 	 * @covers WP_Import::extract_image_urls_from_content
 	 */
 	public function test_extract_image_urls_ignores_css_data_uri() {
+		$this->skip_if_block_markup_url_processor_unavailable();
 		$importer           = new WP_Import();
 		$importer->base_url = 'https://old-site.example.com';
 
@@ -480,6 +495,7 @@ class Tests_Import_Import extends WP_Import_UnitTestCase {
 	 * @covers WP_Import::extract_image_urls_from_content
 	 */
 	public function test_extract_image_urls_finds_block_image_attribute() {
+		$this->skip_if_block_markup_url_processor_unavailable();
 		$importer           = new WP_Import();
 		$importer->base_url = 'https://old-site.example.com';
 
@@ -497,6 +513,7 @@ class Tests_Import_Import extends WP_Import_UnitTestCase {
 	 * @covers WP_Import::extract_image_urls_from_content
 	 */
 	public function test_extract_image_urls_ignores_links() {
+		$this->skip_if_block_markup_url_processor_unavailable();
 		$importer           = new WP_Import();
 		$importer->base_url = 'https://old-site.example.com';
 
@@ -510,6 +527,7 @@ class Tests_Import_Import extends WP_Import_UnitTestCase {
 	 * @covers WP_Import::extract_image_urls_from_content
 	 */
 	public function test_extract_image_urls_resolves_relative_src() {
+		$this->skip_if_block_markup_url_processor_unavailable();
 		$importer           = new WP_Import();
 		$importer->base_url = 'https://old-site.example.com';
 
@@ -523,6 +541,7 @@ class Tests_Import_Import extends WP_Import_UnitTestCase {
 	 * @covers WP_Import::extract_image_urls_from_content
 	 */
 	public function test_extract_image_urls_deduplicates() {
+		$this->skip_if_block_markup_url_processor_unavailable();
 		$importer           = new WP_Import();
 		$importer->base_url = 'https://old-site.example.com';
 
@@ -543,6 +562,7 @@ class Tests_Import_Import extends WP_Import_UnitTestCase {
 	 * @covers WP_Import::process_linked_images
 	 */
 	public function test_download_linked_images_creates_attachments_and_remaps_urls() {
+		$this->skip_if_block_markup_url_processor_unavailable();
 		$this->previous_uploads_structure = get_option( 'uploads_use_yearmonth_folders', true );
 		update_option( 'uploads_use_yearmonth_folders', 0 );
 

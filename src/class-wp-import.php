@@ -1696,6 +1696,12 @@ class WP_Import extends WP_Importer {
 			return array();
 		}
 
+		// BlockMarkupUrlProcessor requires WP_HTML_Tag_Processor::next_token(),
+		// which was introduced in WordPress 6.5.
+		if ( ! method_exists( 'WP_HTML_Tag_Processor', 'next_token' ) ) {
+			return array();
+		}
+
 		$urls = array();
 		$p    = new BlockMarkupUrlProcessor( $content, $this->base_url );
 
@@ -1878,6 +1884,7 @@ class WP_Import extends WP_Importer {
 				'post_status'  => 'inherit',
 				'post_type'    => 'attachment',
 				'upload_date'  => '',
+				'guid'         => $fetch_url,
 			);
 
 			$upload = $this->fetch_remote_file( $fetch_url, $post );
