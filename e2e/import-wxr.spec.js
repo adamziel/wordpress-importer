@@ -298,6 +298,42 @@ https://playground.internal/path-not-taken was the second best choice.
 });
 
 test.describe('General tests', () => {
+	test('downloads linked images when the checkbox is checked', async ({ page, request }) => {
+		await withPlaygroundServer(async () => {
+			await runWxrImport(page, 'wxr-linked-images.xml', {
+				rewriteUrls: false,
+				downloadLinkedImages: true,
+			});
+
+			// Verify that attachment posts were created for the linked images.
+			// The fixture has 3 unique image URLs (block-photo, inline-photo, hero-bg).
+			const mediaRes = await request.get(
+				abs('/wp-json/wp/v2/media?per_page=50')
+			);
+			expect(mediaRes.ok()).toBeTruthy();
+			const media = await mediaRes.json();
+			expect(media.length).toBeGreaterThanOrEqual(3);
+
+			// Verify each attachment has a local source URL (not the old domain).
+			for (const item of media) {
+				expect(item.source_url).not.toContain('old-site-e2e-test.example.com');
+				expect(item.source_url).toContain(PLAYGROUND_URL);
+			}
+
+			// Verify the post content was updated: old image URLs replaced with local ones.
+			const posts = await getPostsEdit(page, 'Linked Images');
+			expect(posts.length).toBeGreaterThan(0);
+			const post = findPostByTitle(posts, 'Linked Images Test Post');
+			const normalized = normalizePostData(post);
+
+			expect(normalized.rawContent).not.toContain(
+				'old-site-e2e-test.example.com/images/'
+			);
+			// Local upload URLs should now be present.
+			expect(normalized.rawContent).toContain('/wp-content/uploads/');
+		});
+	});
+
 	test(`URLs are not rewritten when the checkbox is unchecked`, async ({ page, request }) => {
 		// Run the import
 		await withPlaygroundServer(async () => {
@@ -458,7 +494,7 @@ function abs(u) {
 }
 
 // Helper: Run WXR import process
-async function runWxrImport(page, filename, { rewriteUrls = true } = {}) {
+async function runWxrImport(page, filename, { rewriteUrls = true, downloadLinkedImages = false } = {}) {
 	// Extra time for CI/Playground
 	test.setTimeout(240000);
 
@@ -487,6 +523,10 @@ async function runWxrImport(page, filename, { rewriteUrls = true } = {}) {
 		await page.check('#rewrite-urls');
 	} else {
 		await page.uncheck('#rewrite-urls');
+	}
+
+	if (downloadLinkedImages) {
+		await page.check('#download-linked-images');
 	}
 
 	// Proceed to step=2 (author mapping defaults to current user)

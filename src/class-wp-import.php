@@ -6,6 +6,8 @@
  * @subpackage Importer
  */
 
+use WordPress\DataLiberation\BlockMarkup\BlockMarkupUrlProcessor;
+use WordPress\DataLiberation\CSS\CSSProcessor;
 use WordPress\DataLiberation\URL\WPURL;
 use function WordPress\DataLiberation\URL\wp_rewrite_urls;
 
@@ -38,9 +40,19 @@ class WP_Import extends WP_Importer {
 	public $menu_item_orphans    = array();
 	public $missing_menu_items   = array();
 
-	public $fetch_attachments = false;
-	public $url_remap         = array();
-	public $featured_images   = array();
+	public $fetch_attachments      = false;
+	public $download_linked_images = false;
+	public $url_remap              = array();
+	public $featured_images        = array();
+
+	/**
+	 * Image URLs found in post content that have no corresponding
+	 * attachment post in the WXR file. Collected during process_posts()
+	 * and downloaded afterwards when $download_linked_images is true.
+	 *
+	 * @var array<string, true> URL => true
+	 */
+	public $linked_image_urls = array();
 
 	/**
 	 * Import options.
@@ -71,11 +83,18 @@ class WP_Import extends WP_Importer {
 				break;
 			case 2:
 				check_admin_referer( 'import-wordpress' );
-				$this->fetch_attachments = ( ! empty( $_POST['fetch_attachments'] ) && $this->allow_fetch_attachments() );
-				$this->id                = (int) $_POST['import_id'];
-				$file                    = get_attached_file( $this->id );
+				$this->fetch_attachments      = ( ! empty( $_POST['fetch_attachments'] ) && $this->allow_fetch_attachments() );
+				$this->download_linked_images = ! empty( $_POST['download_linked_images'] );
+				$this->id                     = (int) $_POST['import_id'];
+				$file                         = get_attached_file( $this->id );
 				set_time_limit( 0 );
-				$this->import( $file, array( 'rewrite_urls' => '1' === $_POST['rewrite_urls'] ) );
+				$this->import(
+					$file,
+					array(
+						'rewrite_urls'           => '1' === $_POST['rewrite_urls'],
+						'download_linked_images' => $this->download_linked_images,
+					)
+				);
 				break;
 		}
 
@@ -93,9 +112,12 @@ class WP_Import extends WP_Importer {
 		$options = wp_parse_args(
 			$options,
 			array(
-				'rewrite_urls' => false,
+				'rewrite_urls'           => false,
+				'download_linked_images' => false,
 			)
 		);
+
+		$this->download_linked_images = $options['download_linked_images'];
 
 		$this->options = apply_filters( 'wp_import_options', $options );
 
@@ -138,6 +160,7 @@ class WP_Import extends WP_Importer {
 
 		// update incorrect/missing information in the DB
 		$this->backfill_parents();
+		$this->process_linked_images();
 		$this->backfill_attachment_urls();
 		$this->remap_featured_images();
 
@@ -331,6 +354,11 @@ class WP_Import extends WP_Importer {
 		<label for="import-attachments"><?php _e( 'Download and import file attachments', 'wordpress-importer' ); ?></label>
 	</p>
 		<?php endif; ?>
+
+	<p>
+		<input type="checkbox" value="1" name="download_linked_images" id="download-linked-images" />
+		<label for="download-linked-images"><?php _e( 'Download all linked images', 'wordpress-importer' ); ?></label>
+	</p>
 
 	<h3><?php _e( 'Content Options', 'wordpress-importer' ); ?></h3>
 	<p>
@@ -976,6 +1004,14 @@ class WP_Import extends WP_Importer {
 
 		if ( 1 == $post['is_sticky'] ) {
 			stick_post( $post_id );
+		}
+
+		// Collect image URLs from post content for later downloading.
+		// Uses the original (pre-rewrite) content so we can fetch from the source server.
+		if ( $this->download_linked_images && 'attachment' !== $post['post_type'] ) {
+			foreach ( $this->extract_image_urls_from_content( $post['post_content'] ) as $image_url ) {
+				$this->linked_image_urls[ $image_url ] = true;
+			}
 		}
 
 		$this->processed_posts[ intval( $post['post_id'] ) ] = (int) $post_id;
@@ -1637,6 +1673,284 @@ class WP_Import extends WP_Importer {
 			if ( $local_child_id && $local_parent_id ) {
 				update_post_meta( $local_child_id, '_menu_item_menu_item_parent', (int) $local_parent_id );
 			}
+		}
+	}
+
+	/**
+	 * Extract absolute image URLs from block markup content.
+	 *
+	 * Identifies and extracts URLs that are structurally image references:
+	 * - <img> src/lowsrc/highsrc attributes
+	 * - <body> background attribute
+	 * - CSS background/background-image url() in style attributes (excluding data URIs)
+	 * - wp:image, wp:cover, wp:gallery, wp:media-text block attributes
+	 *
+	 * Uses BlockMarkupUrlProcessor for HTML/block parsing and CSSProcessor for
+	 * strict CSS property identification. No regex or file extension heuristics.
+	 *
+	 * @param string $content Post content (block markup / HTML).
+	 * @return string[] Array of unique absolute image URLs.
+	 */
+	public function extract_image_urls_from_content( $content ) {
+		if ( empty( $content ) ) {
+			return array();
+		}
+
+		// BlockMarkupUrlProcessor requires WP_HTML_Tag_Processor::next_token()
+		// (WordPress 6.5+) and PHP 7.4+ for the underlying URL parser.
+		if ( PHP_VERSION_ID < 70400 || ! method_exists( 'WP_HTML_Tag_Processor', 'next_token' ) ) {
+			return array();
+		}
+
+		$urls = array();
+		$p    = new BlockMarkupUrlProcessor( $content, $this->base_url );
+
+		while ( $p->next_token() ) {
+			$token_type = $p->get_token_type();
+
+			if ( '#tag' === $token_type ) {
+				$tag = $p->get_tag();
+
+				// <img src="...">, <img lowsrc="...">, <img highsrc="...">
+				if ( 'IMG' === $tag ) {
+					foreach ( array( 'src', 'lowsrc', 'highsrc' ) as $attr ) {
+						$val = $p->get_attribute( $attr );
+						if ( is_string( $val ) ) {
+							$parsed = WPURL::parse( $val, $this->base_url );
+							if ( false !== $parsed ) {
+								$urls[] = $parsed->href;
+							}
+						}
+					}
+				}
+
+				// <body background="...">
+				if ( 'BODY' === $tag ) {
+					$val = $p->get_attribute( 'background' );
+					if ( is_string( $val ) ) {
+						$parsed = WPURL::parse( $val, $this->base_url );
+						if ( false !== $parsed ) {
+							$urls[] = $parsed->href;
+						}
+					}
+				}
+
+				// CSS background/background-image url() in style attributes.
+				// Uses CSSProcessor to strictly identify the property name rather
+				// than treating every url() in a style attribute as an image.
+				$style = $p->get_attribute( 'style' );
+				if ( is_string( $style ) ) {
+					foreach ( $this->extract_background_image_urls_from_css( $style ) as $css_url ) {
+						$urls[] = $css_url;
+					}
+				}
+
+				continue;
+			}
+
+			if ( '#block-comment' === $token_type ) {
+				$block_name = $p->get_block_name();
+				if ( in_array( $block_name, array( 'wp:image', 'wp:cover', 'wp:gallery', 'wp:media-text' ), true ) ) {
+					while ( $p->next_url_in_current_token() ) {
+						$parsed = $p->get_parsed_url();
+						if ( $parsed ) {
+							$urls[] = $parsed->href;
+						}
+					}
+				}
+			}
+		}
+
+		return array_unique( $urls );
+	}
+
+	/**
+	 * Extract image URLs from CSS background/background-image properties.
+	 *
+	 * Tokenizes the CSS using CSSProcessor and tracks which property each
+	 * url() belongs to. Only returns URLs from background or background-image
+	 * properties, skipping data URIs.
+	 *
+	 * @param string $css Inline CSS (the value of a style attribute).
+	 * @return string[] Array of absolute image URLs.
+	 */
+	protected function extract_background_image_urls_from_css( $css ) {
+		$urls             = array();
+		$processor        = CSSProcessor::create( $css );
+		$current_property = null;
+		$after_colon      = false;
+
+		while ( $processor->next_token() ) {
+			$type = $processor->get_token_type();
+
+			// Track the CSS property name. Only update when we're before the colon,
+			// so value-side idents like "center" or "no-repeat" don't overwrite it.
+			if ( CSSProcessor::TOKEN_IDENT === $type && ! $after_colon ) {
+				$current_property = strtolower( $processor->get_token_value() );
+				continue;
+			}
+
+			if ( CSSProcessor::TOKEN_COLON === $type ) {
+				$after_colon = true;
+				continue;
+			}
+
+			if ( CSSProcessor::TOKEN_SEMICOLON === $type ) {
+				$current_property = null;
+				$after_colon      = false;
+				continue;
+			}
+
+			// Only extract URLs from background or background-image properties.
+			if ( ! $after_colon || ! in_array( $current_property, array( 'background', 'background-image' ), true ) ) {
+				continue;
+			}
+
+			$url_value = null;
+
+			// Direct url-token: background: url(image.jpg)
+			if ( CSSProcessor::TOKEN_URL === $type ) {
+				if ( ! $processor->is_data_uri() ) {
+					$url_value = $processor->get_token_value();
+				}
+			}
+
+			// Function-token url( + string: background: url("image.jpg")
+			if ( CSSProcessor::TOKEN_FUNCTION === $type && 0 === strcasecmp( $processor->get_token_value(), 'url' ) ) {
+				while ( $processor->next_token() ) {
+					$inner = $processor->get_token_type();
+					if ( CSSProcessor::TOKEN_WHITESPACE === $inner ) {
+						continue;
+					}
+					if ( CSSProcessor::TOKEN_STRING === $inner && ! $processor->is_data_uri() ) {
+						$url_value = $processor->get_token_value();
+					}
+					break;
+				}
+			}
+
+			if ( null !== $url_value ) {
+				$parsed = WPURL::parse( $url_value, $this->base_url );
+				if ( false !== $parsed ) {
+					$urls[] = $parsed->href;
+				}
+			}
+		}
+
+		return $urls;
+	}
+
+	/**
+	 * Download image URLs found in post content that were not already
+	 * imported as WXR attachment posts.
+	 *
+	 * Creates attachment posts for each downloaded image and populates
+	 * url_remap so that backfill_attachment_urls() will update post content.
+	 */
+	public function process_linked_images() {
+		if ( ! $this->download_linked_images || empty( $this->linked_image_urls ) ) {
+			return;
+		}
+
+		// Collect URLs that were already handled as WXR attachments so we skip them.
+		$already_remapped = array();
+		foreach ( $this->url_remap as $from_url => $to_url ) {
+			$already_remapped[ $from_url ] = true;
+		}
+
+		foreach ( $this->linked_image_urls as $url => $_ ) {
+			// Skip if this URL (or a stem of it) was already remapped by attachment processing.
+			$skip = false;
+			foreach ( $already_remapped as $remapped_url => $v ) {
+				if ( false !== strpos( $url, $remapped_url ) ) {
+					$skip = true;
+					break;
+				}
+			}
+			if ( $skip ) {
+				continue;
+			}
+
+			// Resolve relative URLs against the base URL. All URLs should already
+			// be absolute (resolved during extraction), but handle edge cases.
+			$parsed_fetch_url = WPURL::parse( $url, $this->base_url );
+			if ( false === $parsed_fetch_url ) {
+				continue;
+			}
+			$fetch_url = $parsed_fetch_url->href;
+
+			$post = array(
+				'post_title'  => '',
+				'post_status' => 'inherit',
+				'post_type'   => 'attachment',
+				'upload_date' => '',
+				'guid'        => $fetch_url,
+			);
+
+			$upload = $this->fetch_remote_file( $fetch_url, $post );
+			if ( is_wp_error( $upload ) ) {
+				printf(
+					__( 'Failed to download linked image %s', 'wordpress-importer' ),
+					esc_html( $fetch_url )
+				);
+				if ( defined( 'IMPORT_DEBUG' ) && IMPORT_DEBUG ) {
+					echo ': ' . $upload->get_error_message();
+				}
+				echo '<br />';
+				continue;
+			}
+
+			$info = wp_check_filetype( $upload['file'] );
+			if ( ! $info || empty( $info['type'] ) ) {
+				echo '<br />';
+				continue;
+			}
+
+			// Only keep actual images.
+			if ( 0 !== strpos( $info['type'], 'image/' ) ) {
+				@unlink( $upload['file'] );
+				continue;
+			}
+
+			$post['post_mime_type'] = $info['type'];
+			$post['guid']           = $upload['url'];
+			$post['post_title']     = pathinfo( $upload['file'], PATHINFO_FILENAME );
+
+			$post_id = wp_insert_attachment( $post, $upload['file'] );
+			wp_update_attachment_metadata( $post_id, wp_generate_attachment_metadata( $post_id, $upload['file'] ) );
+
+			// Remap the original URL to the new local URL so that backfill_attachment_urls()
+			// will update post content. Use URL stems (without extension) to also catch
+			// resized variations like image-150x150.jpg.
+			$parts = pathinfo( $url );
+			$name  = isset( $parts['extension'] )
+				? basename( $parts['basename'], ".{$parts['extension']}" )
+				: $parts['basename'];
+
+			$parts_new = pathinfo( $upload['url'] );
+			$name_new  = isset( $parts_new['extension'] )
+				? basename( $parts_new['basename'], ".{$parts_new['extension']}" )
+				: $parts_new['basename'];
+
+			$this->url_remap[ $parts['dirname'] . '/' . $name ] = $parts_new['dirname'] . '/' . $name_new;
+
+			// If URL rewriting changed the domain in post content, also add a remap entry
+			// for the rewritten URL so the replacement matches what's actually in the DB.
+			if (
+				$this->options['rewrite_urls'] &&
+				$this->base_url_parsed &&
+				$this->site_url_parsed
+			) {
+				$base_str       = rtrim( $this->base_url_parsed->toString(), '/' );
+				$site_str       = rtrim( $this->site_url_parsed->toString(), '/' );
+				$rewritten_stem = str_replace( $base_str, $site_str, $parts['dirname'] . '/' . $name );
+				if ( $rewritten_stem !== $parts['dirname'] . '/' . $name ) {
+					$this->url_remap[ $rewritten_stem ] = $parts_new['dirname'] . '/' . $name_new;
+				}
+			}
+
+			printf( __( 'Downloaded linked image: %s', 'wordpress-importer' ), esc_html( $fetch_url ) );
+			echo '<br />';
 		}
 	}
 
