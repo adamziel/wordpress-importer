@@ -1696,9 +1696,9 @@ class WP_Import extends WP_Importer {
 			return array();
 		}
 
-		// BlockMarkupUrlProcessor requires WP_HTML_Tag_Processor::next_token(),
-		// which was introduced in WordPress 6.5.
-		if ( ! method_exists( 'WP_HTML_Tag_Processor', 'next_token' ) ) {
+		// BlockMarkupUrlProcessor requires WP_HTML_Tag_Processor::next_token()
+		// (WordPress 6.5+) and PHP 7.4+ for the underlying URL parser.
+		if ( PHP_VERSION_ID < 70400 || ! method_exists( 'WP_HTML_Tag_Processor', 'next_token' ) ) {
 			return array();
 		}
 
