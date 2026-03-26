@@ -351,6 +351,63 @@ https://playground.internal/path-not-taken was the second best choice.
 			await expect(page.locator('a[href="https://w.org"]')).toBeVisible();
 		});
 	});
+
+	test(`imports images from post content`, async ({ page, request }) => {
+		await withPlaygroundServer(async () => {
+			test.setTimeout(300000);
+
+			// Navigate to wp-admin and ensure login
+			await page.goto(abs('/wp-admin/'));
+			await loginIfNeeded(page);
+
+			// Go directly to the importer screen
+			await page.goto(abs('/wp-admin/admin.php?import=wordpress'));
+			await loginIfNeeded(page);
+
+			// Upload the WXR file
+			const wxrPath = path.resolve(__dirname, './fixtures/wxr-import-images-from-content.xml');
+			const fileInput = page.locator('#upload, input[type="file"][name="import"]');
+			await fileInput.waitFor({ state: 'visible' });
+			await fileInput.setInputFiles(wxrPath);
+
+			await page.getByRole('button', { name: /Upload file and import/i }).click();
+
+			// Submit the upload form (step=1: author mapping)
+			await page.waitForURL('**/admin.php?import=wordpress&step=1**', {
+				waitUntil: 'domcontentloaded',
+			});
+
+			// Enable both checkboxes
+			await page.check('#import-attachments');
+			await page.check('#import-images-from-content');
+			await page.check('#rewrite-urls');
+
+			// Proceed to step=2
+			await page.getByRole('button', { name: /^Submit$/i }).click();
+			await page.waitForURL('**/admin.php?import=wordpress&step=2**', {
+				waitUntil: 'domcontentloaded',
+			});
+
+			// Verify import success
+			await expect(page.locator('text=All done.')).toBeVisible();
+
+			// Verify the image extraction feature ran
+			await expect(page.locator('text=Extracting images from post content')).toBeVisible();
+
+			// Verify the summary message shows correct counts
+			// Expected: Found 7 images (5 unique + 2 canola duplicates)
+			// Skipped: 2 (the canola images that are also explicit attachments)
+			await expect(page.locator('text=Found 7 images in post content')).toBeVisible();
+			await expect(page.locator('text=Skipped (duplicates): 2')).toBeVisible();
+
+			// Verify posts were imported
+			const posts = await getPostsEdit(page, 'Inline Image Only');
+			expect(posts.length).toBeGreaterThan(0);
+			const post = findPostByTitle(posts, 'Post with Inline Image Only');
+			expect(post).toBeTruthy();
+		});
+	});
+
 });
 
 // Helpers
